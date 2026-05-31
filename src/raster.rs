@@ -1,10 +1,10 @@
 //! Tiny-skia rasterizer.  Walks a [`Frame`]'s display list and paints
-//! the `FillRect` and `StrokeRect` commands into an RGBA pixel buffer.
+//! the `FillRect`, `StrokeRect`, and `FillText` commands into an RGBA
+//! pixel buffer.  `FillText` is delegated to a [`TextRenderer`] which
+//! does cosmic-text shaping + swash glyph rasterization.
 //!
-//! v0.2 limitations:
+//! v0.3 limitations:
 //!
-//! - `FillText` is recorded as a placeholder rectangle (background
-//!   highlight only); proper text shaping waits on v0.3 cosmic-text.
 //! - No clipping, transforms, or stacking contexts.
 //! - No anti-aliased path edges beyond what tiny-skia gives by default.
 
@@ -12,6 +12,7 @@ use paint_cat::PaintCommand;
 use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform};
 
 use crate::frame::Frame;
+use crate::text::TextRenderer;
 
 /// A rasterized pixel buffer.
 #[derive(Debug, Clone)]
@@ -58,12 +59,27 @@ impl PixelBuffer {
     }
 }
 
-/// Rasterize `frame` into an RGBA pixel buffer of the given size.
-/// The viewport is treated as starting at `(0, 0)`; pixels outside the
-/// requested dimensions are clipped by tiny-skia.
+/// Rasterize `frame` into an RGBA pixel buffer of the given size,
+/// building a fresh [`TextRenderer`] for this call.  Convenient but
+/// pays the font-load cost on every call.  Use
+/// [`render_to_pixels_with`] to amortize.
 #[must_use]
 pub fn render_to_pixels(frame: &Frame, width: u32, height: u32) -> PixelBuffer {
-    let bytes = rasterize_to_bytes(frame, width, height);
+    let mut text_renderer = TextRenderer::new();
+    render_to_pixels_with(frame, width, height, &mut text_renderer)
+}
+
+/// Rasterize `frame` into an RGBA pixel buffer of the given size using
+/// a caller-supplied [`TextRenderer`].  Reuse the renderer across
+/// calls to amortize the font-loading cost.
+#[must_use]
+pub fn render_to_pixels_with(
+    frame: &Frame,
+    width: u32,
+    height: u32,
+    text_renderer: &mut TextRenderer,
+) -> PixelBuffer {
+    let bytes = rasterize_to_bytes(frame, width, height, text_renderer);
     PixelBuffer {
         width,
         height,
@@ -71,10 +87,15 @@ pub fn render_to_pixels(frame: &Frame, width: u32, height: u32) -> PixelBuffer {
     }
 }
 
-fn rasterize_to_bytes(frame: &Frame, width: u32, height: u32) -> Vec<u8> {
+fn rasterize_to_bytes(
+    frame: &Frame,
+    width: u32,
+    height: u32,
+    text_renderer: &mut TextRenderer,
+) -> Vec<u8> {
     Pixmap::new(width, height).map_or_else(
         || empty_bytes(width, height),
-        |pixmap| paint_commands(pixmap, frame),
+        |pixmap| paint_commands(pixmap, frame, text_renderer),
     )
 }
 
@@ -90,32 +111,34 @@ fn empty_bytes(width: u32, height: u32) -> Vec<u8> {
     vec![0; total]
 }
 
-fn paint_commands(pixmap_in: Pixmap, frame: &Frame) -> Vec<u8> {
+fn paint_commands(pixmap_in: Pixmap, frame: &Frame, text_renderer: &mut TextRenderer) -> Vec<u8> {
     // External `&mut self` carve-out for tiny-skia's `fill_path` /
     // `stroke_path`.  Pixmap construction returns an owned value; we
     // shadow the binding as `mut` only to satisfy the tiny-skia API.
     let mut pixmap = pixmap_in;
     pixmap.fill(tiny_skia::Color::TRANSPARENT);
     frame.display_list().commands().iter().for_each(|cmd| {
-        apply_command(&mut pixmap, cmd);
+        apply_command(&mut pixmap, cmd, text_renderer);
     });
     pixmap.take()
 }
 
-fn apply_command(pixmap: &mut Pixmap, command: &PaintCommand) {
+fn apply_command(pixmap: &mut Pixmap, command: &PaintCommand, text_renderer: &mut TextRenderer) {
     match command {
         PaintCommand::FillRect { rect, color } => fill_rect(pixmap, rect, color),
         PaintCommand::StrokeRect { rect, color, width } => stroke_rect(pixmap, rect, color, *width),
-        PaintCommand::FillText { rect, color, .. } => placeholder_text(pixmap, rect, color),
+        PaintCommand::FillText {
+            rect,
+            text,
+            color,
+            font_size,
+        } => text_renderer.render_text(pixmap, *rect, text, *color, *font_size),
     }
 }
 
 fn fill_rect(pixmap: &mut Pixmap, rect: &layout_cat::Rect, color: &layout_cat::Color) {
     if let Some(skia_rect) = rect_to_skia(rect) {
         let paint = build_paint(color);
-        if let Some(path) = PathBuilder::from_rect(skia_rect).into() {
-            let _ = path;
-        }
         let path = PathBuilder::from_rect(skia_rect);
         pixmap.fill_path(
             &path,
@@ -142,19 +165,6 @@ fn stroke_rect(
         };
         pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
     }
-}
-
-fn placeholder_text(pixmap: &mut Pixmap, rect: &layout_cat::Rect, color: &layout_cat::Color) {
-    // Until cosmic-text lands in v0.3, FillText is rendered as a faint
-    // highlight at 30% of the text color's alpha so callers can see
-    // that text would appear in that region.
-    let dimmed = layout_cat::Color::rgba(
-        color.red(),
-        color.green(),
-        color.blue(),
-        color.alpha() * 0.3,
-    );
-    fill_rect(pixmap, rect, &dimmed);
 }
 
 fn rect_to_skia(rect: &layout_cat::Rect) -> Option<Rect> {

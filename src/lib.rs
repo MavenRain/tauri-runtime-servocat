@@ -1,7 +1,10 @@
 //! Servo-replacement runtime for Tauri.
 //!
-//! v0.1 shipped the headless pipeline + script driver; v0.2 adds a
-//! tiny-skia rasterizer ([`render_to_pixels`]).
+//! v0.1 shipped the headless pipeline + script driver; v0.2 added a
+//! tiny-skia rasterizer ([`render_to_pixels`]); v0.3 adds cosmic-text
+//! shaping + swash glyph raster so `FillText` commands render real
+//! text.  Reuse a [`TextRenderer`] across calls via
+//! [`render_to_pixels_with`] to amortize font-loading cost.
 //!
 //! # Example
 //!
@@ -38,10 +41,12 @@ pub mod frame;
 pub mod pipeline;
 pub mod raster;
 pub mod script;
+pub mod text;
 
 pub use error::Error;
 pub use frame::Frame;
 pub use layout_cat::Viewport;
 pub use pipeline::render;
-pub use raster::{PixelBuffer, render_to_pixels};
+pub use raster::{PixelBuffer, render_to_pixels, render_to_pixels_with};
 pub use script::{DEFAULT_FUEL, run_script};
+pub use text::TextRenderer;

@@ -1,8 +1,8 @@
 [package]
 name = "tauri-runtime-servocat"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
-description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline. v0.2.0 adds a tiny-skia rasterizer (FillRect + StrokeRect; FillText placeholder until v0.3 cosmic-text). The cosmic-text shaping, winit window, IPC bridge, and tauri_runtime::Runtime trait impl are committed-to deliverables for subsequent versions. The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
+description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline. v0.3.0 adds cosmic-text shaping + swash glyph raster so FillText commands render real text. winit window, IPC bridge, and tauri_runtime::Runtime trait impl are committed-to deliverables for subsequent versions. The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
 license = "MIT OR Apache-2.0"
 keywords = ["tauri", "runtime", "browser", "servo", "type-driven"]
 categories = ["gui", "rendering"]
@@ -20,6 +20,7 @@ web-api-cat = "0.1"
 ecma-lex-cat = "0.1"
 ecma-parse-cat = "0.1"
 tiny-skia = "0.12"
+cosmic-text = "0.19"
 
 [dev-dependencies]
 proptest = "1"
