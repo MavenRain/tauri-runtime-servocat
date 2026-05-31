@@ -2,8 +2,6 @@
 
 Servo-replacement runtime for Tauri: wires the full `comp-cat-rs` cat-stack ([`html-cat`](https://crates.io/crates/html-cat), [`css-cat`](https://crates.io/crates/css-cat), [`dom-cat`](https://crates.io/crates/dom-cat), [`layout-cat`](https://crates.io/crates/layout-cat), [`paint-cat`](https://crates.io/crates/paint-cat), [`net-cat`](https://crates.io/crates/net-cat), [`boa-cat`](https://crates.io/crates/boa-cat), [`ecma-runtime-cat`](https://crates.io/crates/ecma-runtime-cat), [`web-api-cat`](https://crates.io/crates/web-api-cat)) into a single rendering + scripting pipeline.
 
-The Servo no-AI policy disqualifies upstream contribution; this stack is the AI-built parallel.
-
 ## Example
 
 ```rust
