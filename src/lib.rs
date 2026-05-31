@@ -3,8 +3,10 @@
 //! v0.1 shipped the headless pipeline + script driver; v0.2 added a
 //! tiny-skia rasterizer ([`render_to_pixels`]); v0.3 added cosmic-text
 //! shaping + swash glyph raster so `FillText` commands render real
-//! text; v0.4 adds a winit + softbuffer window via [`run_window`] and
-//! a runnable demo binary (`cargo run --bin demo`).
+//! text; v0.4 added a winit + softbuffer window via [`run_window`] and
+//! a runnable demo binary; v0.5 adds an IPC bridge ([`HostCommands`])
+//! plus DOM-mutation back-propagation via [`run_script_with_backprop`]
+//! so scripted mutations re-render in the window.
 //!
 //! # Example
 //!
@@ -38,6 +40,7 @@
 
 pub mod error;
 pub mod frame;
+pub mod ipc;
 pub mod pipeline;
 pub mod raster;
 pub mod script;
@@ -46,9 +49,10 @@ pub mod window;
 
 pub use error::Error;
 pub use frame::Frame;
+pub use ipc::HostCommands;
 pub use layout_cat::Viewport;
 pub use pipeline::render;
 pub use raster::{PixelBuffer, render_to_pixels, render_to_pixels_with};
-pub use script::{DEFAULT_FUEL, run_script};
+pub use script::{DEFAULT_FUEL, run_script, run_script_with_backprop, run_script_with_commands};
 pub use text::TextRenderer;
 pub use window::run_window;

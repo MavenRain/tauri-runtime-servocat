@@ -1,8 +1,8 @@
 [package]
 name = "tauri-runtime-servocat"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
-description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline. v0.4.0 adds a winit + softbuffer window and a runnable demo binary so the rasterized output can be shown on-screen. IPC bridge and tauri_runtime::Runtime trait impl are committed-to deliverables for subsequent versions. The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
+description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline. v0.5.0 adds an IPC bridge so JS scripts can call host commands via `__TAURI__.invoke(cmd, ...args)`, and back-propagates scripted DOM mutations into layout via `web_api_cat::extract_document`. tauri_runtime::Runtime trait impl is the remaining committed deliverable. The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
 license = "MIT OR Apache-2.0"
 keywords = ["tauri", "runtime", "browser", "servo", "type-driven"]
 categories = ["gui", "rendering"]
@@ -16,7 +16,7 @@ paint-cat = "0.1"
 net-cat = "0.1"
 boa-cat = "0.2"
 ecma-runtime-cat = "0.1"
-web-api-cat = "0.1"
+web-api-cat = "0.2"
 ecma-lex-cat = "0.1"
 ecma-parse-cat = "0.1"
 tiny-skia = "0.12"
