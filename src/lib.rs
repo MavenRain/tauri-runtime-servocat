@@ -1,11 +1,13 @@
-//! Servo-replacement runtime for Tauri (v0.1.0: headless pipeline +
-//! script driver).
+//! Servo-replacement runtime for Tauri.
+//!
+//! v0.1 shipped the headless pipeline + script driver; v0.2 adds a
+//! tiny-skia rasterizer ([`render_to_pixels`]).
 //!
 //! # Example
 //!
 //! ```
 //! # fn main() -> Result<(), tauri_runtime_servocat::Error> {
-//! use tauri_runtime_servocat::{Viewport, render, run_script};
+//! use tauri_runtime_servocat::{Viewport, render, render_to_pixels, run_script};
 //!
 //! let frame = render(
 //!     "<html><body><p>hello</p></body></html>",
@@ -13,6 +15,9 @@
 //!     Viewport::new(800, 600),
 //! )?;
 //! assert!(!frame.display_list().is_empty());
+//!
+//! let pixels = render_to_pixels(&frame, 800, 600);
+//! assert_eq!(pixels.rgba().len(), 800 * 600 * 4);
 //!
 //! let scripted = run_script(
 //!     "<html><body><p id='g'>hi</p></body></html>",
@@ -31,10 +36,12 @@
 pub mod error;
 pub mod frame;
 pub mod pipeline;
+pub mod raster;
 pub mod script;
 
 pub use error::Error;
 pub use frame::Frame;
 pub use layout_cat::Viewport;
 pub use pipeline::render;
+pub use raster::{PixelBuffer, render_to_pixels};
 pub use script::{DEFAULT_FUEL, run_script};
