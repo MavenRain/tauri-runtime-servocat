@@ -44,6 +44,7 @@ pub mod ipc;
 pub mod pipeline;
 pub mod raster;
 pub mod script;
+pub mod tauri_impl;
 pub mod text;
 pub mod window;
 
@@ -54,5 +55,9 @@ pub use layout_cat::Viewport;
 pub use pipeline::render;
 pub use raster::{PixelBuffer, render_to_pixels, render_to_pixels_with};
 pub use script::{DEFAULT_FUEL, run_script, run_script_with_backprop, run_script_with_commands};
+pub use tauri_impl::{
+    ServocatEventLoopProxy, ServocatHandle, ServocatRuntime, ServocatWebviewDispatch,
+    ServocatWindowBuilder, ServocatWindowDispatch,
+};
 pub use text::TextRenderer;
 pub use window::run_window;

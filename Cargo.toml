@@ -1,8 +1,8 @@
 [package]
 name = "tauri-runtime-servocat"
-version = "0.5.0"
+version = "1.0.0"
 edition = "2024"
-description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline. v0.5.0 adds an IPC bridge so JS scripts can call host commands via `__TAURI__.invoke(cmd, ...args)`, and back-propagates scripted DOM mutations into layout via `web_api_cat::extract_document`. tauri_runtime::Runtime trait impl is the remaining committed deliverable. The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
+description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v1.0.0 implements the `tauri_runtime::Runtime` trait surface (Runtime, RuntimeHandle, WindowDispatch, WebviewDispatch, EventLoopProxy, WindowBuilder) as a stub-heavy skeleton so it can be plugged into a Tauri app; non-cosmetic methods return `tauri_runtime::Error` and will be filled in over the 1.x patch series.  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
 license = "MIT OR Apache-2.0"
 keywords = ["tauri", "runtime", "browser", "servo", "type-driven"]
 categories = ["gui", "rendering"]
@@ -23,6 +23,12 @@ tiny-skia = "0.12"
 cosmic-text = "0.19"
 winit = "0.30"
 softbuffer = "0.4"
+tauri-runtime = "2"
+tauri-utils = "2"
+raw-window-handle = "0.6"
+url = "2"
+http = "1"
+cookie = "0.18"
 
 [dev-dependencies]
 proptest = "1"
