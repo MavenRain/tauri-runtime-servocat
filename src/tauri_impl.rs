@@ -1,31 +1,58 @@
-//! v1.0 implementation of the `tauri_runtime::Runtime` trait surface.
+//! v1.1 implementation of the `tauri_runtime::Runtime` trait surface.
 //!
-//! This is a *skeleton*: every non-cosmetic method on each of the five
-//! traits ([`Runtime`], [`RuntimeHandle`], [`WindowDispatch`],
-//! [`WebviewDispatch`], [`EventLoopProxy`]) returns a
-//! [`tauri_runtime::Error`] (typically [`Error::WindowNotFound`] for
-//! window-side operations, [`Error::FailedToSendMessage`] for IPC,
-//! and [`Error::CreateWindow`] / [`Error::CreateWebview`] for
-//! lifecycle) or a sensible zero value (empty `Vec`, `None`,
-//! `false`, `Theme::Light`).  Cosmetic / void methods are no-ops.
+//! Backed by a real winit event loop:
 //!
-//! The intent is to compile against `tauri-runtime = "2"` so a Tauri
-//! app can be parameterized over [`ServocatRuntime`].  Real
-//! implementations of each method will land in subsequent 1.x patch
-//! releases (1.1: window lifecycle wired to [`crate::run_window`];
-//! 1.2: webview eval through the IPC bridge; 1.3: real event loop /
-//! proxy; ...).
+//! - [`ServocatRuntime::new`] creates a winit [`EventLoop`] with our
+//!   internal [`RuntimeEvent<T>`] payload.
+//! - [`Runtime::create_window`] allocates a [`WindowId`] and sends a
+//!   `RuntimeEvent::CreateWindow` through the proxy; the actual winit
+//!   window is constructed inside the event-loop handler when the
+//!   event is delivered.
+//! - [`Runtime::run`] consumes the event loop and drives an
+//!   [`ApplicationHandler`] that creates queued windows, routes winit
+//!   `WindowEvent`s to `tauri_runtime::WindowEvent`s, and forwards
+//!   user-defined events.
+//! - [`WindowDispatch::set_title`] / [`set_size`] / [`set_position`] /
+//!   [`show`] / [`hide`] / [`close`] / [`set_focus`] / [`maximize`] /
+//!   [`unmaximize`] / [`minimize`] / [`unminimize`] / [`set_resizable`] /
+//!   [`set_decorations`] / [`set_fullscreen`] send their commands
+//!   through the proxy.  Other [`WindowDispatch`] methods (getters
+//!   that need to inspect window state from another thread, anything
+//!   webview-shaped, IME / cursor positioning) still return errors or
+//!   no-op zero values and are slated for 1.2+.
 //!
 //! [`Runtime`]: tauri_runtime::Runtime
-//! [`RuntimeHandle`]: tauri_runtime::RuntimeHandle
-//! [`WindowDispatch`]: tauri_runtime::window::WindowBuilder
-//! [`WebviewDispatch`]: tauri_runtime::WebviewDispatch
-//! [`EventLoopProxy`]: tauri_runtime::EventLoopProxy
-//! [`Error::WindowNotFound`]: tauri_runtime::Error::WindowNotFound
+//! [`Runtime::create_window`]: tauri_runtime::Runtime::create_window
+//! [`Runtime::run`]: tauri_runtime::Runtime::run
+//! [`WindowDispatch`]: tauri_runtime::WindowDispatch
+//! [`WindowDispatch::set_title`]: tauri_runtime::WindowDispatch::set_title
+//! [`set_size`]: tauri_runtime::WindowDispatch::set_size
+//! [`set_position`]: tauri_runtime::WindowDispatch::set_position
+//! [`show`]: tauri_runtime::WindowDispatch::show
+//! [`hide`]: tauri_runtime::WindowDispatch::hide
+//! [`close`]: tauri_runtime::WindowDispatch::close
+//! [`set_focus`]: tauri_runtime::WindowDispatch::set_focus
+//! [`maximize`]: tauri_runtime::WindowDispatch::maximize
+//! [`unmaximize`]: tauri_runtime::WindowDispatch::unmaximize
+//! [`minimize`]: tauri_runtime::WindowDispatch::minimize
+//! [`unminimize`]: tauri_runtime::WindowDispatch::unminimize
+//! [`set_resizable`]: tauri_runtime::WindowDispatch::set_resizable
+//! [`set_decorations`]: tauri_runtime::WindowDispatch::set_decorations
+//! [`set_fullscreen`]: tauri_runtime::WindowDispatch::set_fullscreen
+//! [`EventLoop`]: winit::event_loop::EventLoop
+//! [`ApplicationHandler`]: winit::application::ApplicationHandler
 
-#![allow(clippy::needless_pass_by_value, clippy::unused_self, unexpected_cfgs)]
+#![allow(
+    clippy::needless_pass_by_value,
+    clippy::unused_self,
+    clippy::too_many_lines,
+    unexpected_cfgs
+)]
 
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc;
 
 use cookie::Cookie;
 use raw_window_handle::{DisplayHandle, HandleError, WindowHandle};
@@ -34,151 +61,272 @@ use tauri_runtime::monitor::Monitor;
 use tauri_runtime::webview::{DetachedWebview, PendingWebview};
 use tauri_runtime::window::{
     CursorIcon, DetachedWindow, PendingWindow, RawWindow, WebviewEvent, WindowBuilder,
-    WindowBuilderBase, WindowEvent, WindowId, WindowSizeConstraints,
+    WindowBuilderBase, WindowEvent as TauriWindowEvent, WindowId, WindowSizeConstraints,
 };
 use tauri_runtime::{
-    DeviceEventFilter, Error, EventLoopProxy, Icon, ProgressBarState, Result, RunEvent, Runtime,
-    RuntimeHandle, RuntimeInitArgs, UserEvent, WebviewDispatch, WebviewEventId, WindowDispatch,
-    WindowEventId,
+    DeviceEventFilter, Error, EventLoopProxy as TauriEventLoopProxy, Icon, ProgressBarState,
+    Result, RunEvent, Runtime, RuntimeHandle, RuntimeInitArgs, UserEvent, WebviewDispatch,
+    WebviewEventId, WindowDispatch, WindowEventId,
 };
 use tauri_utils::config::{Color, WindowConfig};
 use tauri_utils::{Theme, TitleBarStyle};
 use url::Url;
+use winit::application::ApplicationHandler;
+use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition as WinitPhysicalPosition};
+use winit::event::WindowEvent as WinitWindowEvent;
+use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::window::{Fullscreen, Window, WindowAttributes, WindowId as WinitWindowId};
 
-/// The Servocat runtime.  Stateless skeleton; see module docs.
+static NEXT_WINDOW_ID: AtomicU32 = AtomicU32::new(1);
+
+fn allocate_window_id() -> WindowId {
+    WindowId::from(NEXT_WINDOW_ID.fetch_add(1, Ordering::SeqCst))
+}
+
+fn raw_window_id(id: WindowId) -> u32 {
+    // `WindowId` is a `pub struct WindowId(u32)` newtype with `From<u32>`
+    // but no direct accessor.  Round-trip through `Debug` to recover
+    // the raw value -- ugly but stable for v1.1.
+    let debug = format!("{id:?}");
+    debug
+        .trim_start_matches("WindowId(")
+        .trim_end_matches(')')
+        .parse::<u32>()
+        .unwrap_or(0)
+}
+
+/// Cross-thread message sent through the winit `EventLoopProxy` to
+/// command the runtime from another thread (a [`ServocatHandle`] /
+/// [`ServocatWindowDispatch`] / [`ServocatWebviewDispatch`]).
+#[derive(Debug, Clone)]
+pub enum RuntimeEvent<T: UserEvent> {
+    /// A user-defined event surfaced through `Runtime::run`'s callback.
+    User(T),
+    /// Asks the runtime to create a window with the given attributes
+    /// under the given id and label.
+    CreateWindow {
+        id: WindowId,
+        label: String,
+        attributes: ServocatWindowBuilder,
+    },
+    /// Sets the title of an existing window.
+    SetTitle { id: WindowId, title: String },
+    /// Resizes an existing window.
+    SetSize { id: WindowId, size: Size },
+    /// Repositions an existing window.
+    SetPosition { id: WindowId, position: Position },
+    /// Shows an existing window.
+    Show { id: WindowId },
+    /// Hides an existing window.
+    Hide { id: WindowId },
+    /// Focuses an existing window.
+    Focus { id: WindowId },
+    /// Closes an existing window.
+    Close { id: WindowId },
+    /// Destroys an existing window.
+    Destroy { id: WindowId },
+    /// Maximizes an existing window.
+    Maximize { id: WindowId },
+    /// Unmaximizes an existing window.
+    Unmaximize { id: WindowId },
+    /// Minimizes an existing window.
+    Minimize { id: WindowId },
+    /// Unminimizes an existing window.
+    Unminimize { id: WindowId },
+    /// Updates the resizable flag of an existing window.
+    SetResizable { id: WindowId, resizable: bool },
+    /// Updates the decorations flag of an existing window.
+    SetDecorations { id: WindowId, decorations: bool },
+    /// Updates the fullscreen flag of an existing window.
+    SetFullscreen { id: WindowId, fullscreen: bool },
+    /// Asks the runtime to exit with the given code.
+    Exit { code: i32 },
+}
+
+/// The Servocat runtime.  Owns the winit event loop until
+/// [`Runtime::run`] is called.
 pub struct ServocatRuntime<T: UserEvent> {
-    _marker: PhantomData<fn() -> T>,
+    event_loop: Option<EventLoop<RuntimeEvent<T>>>,
+    proxy: EventLoopProxy<RuntimeEvent<T>>,
 }
 
 impl<T: UserEvent> std::fmt::Debug for ServocatRuntime<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("ServocatRuntime").finish()
+        formatter
+            .debug_struct("ServocatRuntime")
+            .field("event_loop", &self.event_loop.is_some())
+            .finish_non_exhaustive()
     }
 }
 
-impl<T: UserEvent> Default for ServocatRuntime<T> {
-    fn default() -> Self {
-        Self {
-            _marker: PhantomData,
-        }
-    }
-}
-
-/// `Send`-able handle to a [`ServocatRuntime`].
+/// `Send`-able handle to a [`ServocatRuntime`].  Holds the proxy used
+/// to enqueue [`RuntimeEvent`]s.
 pub struct ServocatHandle<T: UserEvent> {
-    _marker: PhantomData<fn() -> T>,
+    proxy: EventLoopProxy<RuntimeEvent<T>>,
 }
 
 impl<T: UserEvent> std::fmt::Debug for ServocatHandle<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("ServocatHandle").finish()
+        formatter
+            .debug_struct("ServocatHandle")
+            .finish_non_exhaustive()
     }
 }
 
 impl<T: UserEvent> Clone for ServocatHandle<T> {
     fn clone(&self) -> Self {
         Self {
-            _marker: PhantomData,
+            proxy: self.proxy.clone(),
         }
     }
 }
 
-impl<T: UserEvent> Default for ServocatHandle<T> {
-    fn default() -> Self {
-        Self {
-            _marker: PhantomData,
-        }
-    }
-}
-
-/// `Send`-able dispatcher for [`ServocatRuntime`] windows.
+/// `Send`-able dispatcher for [`ServocatRuntime`] windows.  Holds the
+/// proxy + the dispatched window's id.
 pub struct ServocatWindowDispatch<T: UserEvent> {
+    proxy: EventLoopProxy<RuntimeEvent<T>>,
+    window_id: WindowId,
     _marker: PhantomData<fn() -> T>,
 }
 
 impl<T: UserEvent> std::fmt::Debug for ServocatWindowDispatch<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("ServocatWindowDispatch").finish()
+        formatter
+            .debug_struct("ServocatWindowDispatch")
+            .field("window_id", &self.window_id)
+            .finish_non_exhaustive()
     }
 }
 
 impl<T: UserEvent> Clone for ServocatWindowDispatch<T> {
     fn clone(&self) -> Self {
         Self {
+            proxy: self.proxy.clone(),
+            window_id: self.window_id,
             _marker: PhantomData,
         }
     }
 }
 
-impl<T: UserEvent> Default for ServocatWindowDispatch<T> {
-    fn default() -> Self {
-        Self {
-            _marker: PhantomData,
-        }
-    }
-}
-
-/// `Send`-able dispatcher for [`ServocatRuntime`] webviews.
+/// `Send`-able dispatcher for [`ServocatRuntime`] webviews.  Still
+/// stub-shaped in v1.1; carries the parent window id for routing.
 pub struct ServocatWebviewDispatch<T: UserEvent> {
+    proxy: EventLoopProxy<RuntimeEvent<T>>,
+    window_id: WindowId,
     _marker: PhantomData<fn() -> T>,
 }
 
 impl<T: UserEvent> std::fmt::Debug for ServocatWebviewDispatch<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("ServocatWebviewDispatch").finish()
+        formatter
+            .debug_struct("ServocatWebviewDispatch")
+            .field("window_id", &self.window_id)
+            .finish_non_exhaustive()
     }
 }
 
 impl<T: UserEvent> Clone for ServocatWebviewDispatch<T> {
     fn clone(&self) -> Self {
         Self {
+            proxy: self.proxy.clone(),
+            window_id: self.window_id,
             _marker: PhantomData,
         }
     }
 }
 
-impl<T: UserEvent> Default for ServocatWebviewDispatch<T> {
-    fn default() -> Self {
-        Self {
-            _marker: PhantomData,
-        }
-    }
-}
-
-/// `Send`-able event-loop proxy for [`ServocatRuntime`].
+/// `Send`-able event-loop proxy.  Wraps winit's
+/// [`EventLoopProxy<RuntimeEvent<T>>`] so callers can dispatch
+/// user-typed events.
 pub struct ServocatEventLoopProxy<T: UserEvent> {
-    _marker: PhantomData<fn() -> T>,
+    proxy: EventLoopProxy<RuntimeEvent<T>>,
 }
 
 impl<T: UserEvent> std::fmt::Debug for ServocatEventLoopProxy<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("ServocatEventLoopProxy").finish()
+        formatter
+            .debug_struct("ServocatEventLoopProxy")
+            .finish_non_exhaustive()
     }
 }
 
 impl<T: UserEvent> Clone for ServocatEventLoopProxy<T> {
     fn clone(&self) -> Self {
         Self {
-            _marker: PhantomData,
+            proxy: self.proxy.clone(),
         }
     }
 }
 
-impl<T: UserEvent> Default for ServocatEventLoopProxy<T> {
-    fn default() -> Self {
-        Self {
-            _marker: PhantomData,
-        }
-    }
-}
-
-/// Builder for [`ServocatRuntime`] windows.  Captures none of the
-/// attributes set on it; all settings are quietly discarded in this
-/// skeleton.
+/// Builder for [`ServocatRuntime`] windows.  v1.1 captures the
+/// attributes that map cleanly onto winit's `WindowAttributes` so
+/// queued windows are actually constructed with the requested size,
+/// title, etc.
 #[derive(Debug, Default, Clone)]
 pub struct ServocatWindowBuilder {
+    title: Option<String>,
+    inner_size: Option<(f64, f64)>,
+    min_inner_size: Option<(f64, f64)>,
+    max_inner_size: Option<(f64, f64)>,
+    position: Option<(f64, f64)>,
+    resizable: Option<bool>,
+    maximized: Option<bool>,
+    visible: Option<bool>,
+    decorations: Option<bool>,
+    fullscreen: Option<bool>,
+    transparent: Option<bool>,
     has_icon: bool,
     theme: Option<Theme>,
+}
+
+impl ServocatWindowBuilder {
+    fn to_winit_attributes(&self) -> WindowAttributes {
+        let base = Window::default_attributes();
+        let with_title = self
+            .title
+            .as_ref()
+            .map_or(base.clone(), |title| base.clone().with_title(title));
+        let with_inner = self.inner_size.map_or(with_title.clone(), |(w, h)| {
+            with_title.clone().with_inner_size(LogicalSize::new(w, h))
+        });
+        let with_min = self.min_inner_size.map_or(with_inner.clone(), |(w, h)| {
+            with_inner
+                .clone()
+                .with_min_inner_size(LogicalSize::new(w, h))
+        });
+        let with_max = self.max_inner_size.map_or(with_min.clone(), |(w, h)| {
+            with_min.clone().with_max_inner_size(LogicalSize::new(w, h))
+        });
+        let with_position = self.position.map_or(with_max.clone(), |(x, y)| {
+            with_max.clone().with_position(LogicalPosition::new(x, y))
+        });
+        let with_resizable = self.resizable.map_or(with_position.clone(), |resizable| {
+            with_position.clone().with_resizable(resizable)
+        });
+        let with_maximized = self.maximized.map_or(with_resizable.clone(), |maximized| {
+            with_resizable.clone().with_maximized(maximized)
+        });
+        let with_visible = self.visible.map_or(with_maximized.clone(), |visible| {
+            with_maximized.clone().with_visible(visible)
+        });
+        let with_decorations = self
+            .decorations
+            .map_or(with_visible.clone(), |decorations| {
+                with_visible.clone().with_decorations(decorations)
+            });
+        let with_fullscreen =
+            self.fullscreen
+                .filter(|f| *f)
+                .map_or(with_decorations.clone(), |_fullscreen| {
+                    with_decorations
+                        .clone()
+                        .with_fullscreen(Some(Fullscreen::Borderless(None)))
+                });
+        self.transparent
+            .map_or(with_fullscreen.clone(), |transparent| {
+                with_fullscreen.clone().with_transparent(transparent)
+            })
+    }
 }
 
 impl WindowBuilderBase for ServocatWindowBuilder {}
@@ -196,20 +344,32 @@ impl WindowBuilder for ServocatWindowBuilder {
         self
     }
 
-    fn position(self, _x: f64, _y: f64) -> Self {
-        self
+    fn position(self, x: f64, y: f64) -> Self {
+        Self {
+            position: Some((x, y)),
+            ..self
+        }
     }
 
-    fn inner_size(self, _width: f64, _height: f64) -> Self {
-        self
+    fn inner_size(self, width: f64, height: f64) -> Self {
+        Self {
+            inner_size: Some((width, height)),
+            ..self
+        }
     }
 
-    fn min_inner_size(self, _min_width: f64, _min_height: f64) -> Self {
-        self
+    fn min_inner_size(self, min_width: f64, min_height: f64) -> Self {
+        Self {
+            min_inner_size: Some((min_width, min_height)),
+            ..self
+        }
     }
 
-    fn max_inner_size(self, _max_width: f64, _max_height: f64) -> Self {
-        self
+    fn max_inner_size(self, max_width: f64, max_height: f64) -> Self {
+        Self {
+            max_inner_size: Some((max_width, max_height)),
+            ..self
+        }
     }
 
     fn inner_size_constraints(self, _constraints: WindowSizeConstraints) -> Self {
@@ -224,8 +384,11 @@ impl WindowBuilder for ServocatWindowBuilder {
         self
     }
 
-    fn resizable(self, _resizable: bool) -> Self {
-        self
+    fn resizable(self, resizable: bool) -> Self {
+        Self {
+            resizable: Some(resizable),
+            ..self
+        }
     }
 
     fn maximizable(self, _maximizable: bool) -> Self {
@@ -240,12 +403,18 @@ impl WindowBuilder for ServocatWindowBuilder {
         self
     }
 
-    fn title<S: Into<String>>(self, _title: S) -> Self {
-        self
+    fn title<S: Into<String>>(self, title: S) -> Self {
+        Self {
+            title: Some(title.into()),
+            ..self
+        }
     }
 
-    fn fullscreen(self, _fullscreen: bool) -> Self {
-        self
+    fn fullscreen(self, fullscreen: bool) -> Self {
+        Self {
+            fullscreen: Some(fullscreen),
+            ..self
+        }
     }
 
     fn focused(self, _focused: bool) -> Self {
@@ -256,21 +425,33 @@ impl WindowBuilder for ServocatWindowBuilder {
         self
     }
 
-    fn maximized(self, _maximized: bool) -> Self {
-        self
+    fn maximized(self, maximized: bool) -> Self {
+        Self {
+            maximized: Some(maximized),
+            ..self
+        }
     }
 
-    fn visible(self, _visible: bool) -> Self {
-        self
+    fn visible(self, visible: bool) -> Self {
+        Self {
+            visible: Some(visible),
+            ..self
+        }
     }
 
     #[cfg(any(not(target_os = "macos"), feature = "macos-private-api"))]
-    fn transparent(self, _transparent: bool) -> Self {
-        self
+    fn transparent(self, transparent: bool) -> Self {
+        Self {
+            transparent: Some(transparent),
+            ..self
+        }
     }
 
-    fn decorations(self, _decorations: bool) -> Self {
-        self
+    fn decorations(self, decorations: bool) -> Self {
+        Self {
+            decorations: Some(decorations),
+            ..self
+        }
     }
 
     fn always_on_bottom(self, _always_on_bottom: bool) -> Self {
@@ -350,9 +531,11 @@ impl WindowBuilder for ServocatWindowBuilder {
     }
 }
 
-impl<T: UserEvent> EventLoopProxy<T> for ServocatEventLoopProxy<T> {
-    fn send_event(&self, _event: T) -> Result<()> {
-        Err(Error::EventLoopClosed)
+impl<T: UserEvent> TauriEventLoopProxy<T> for ServocatEventLoopProxy<T> {
+    fn send_event(&self, event: T) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::User(event))
+            .map_err(|_e| Error::EventLoopClosed)
     }
 }
 
@@ -363,23 +546,34 @@ impl<T: UserEvent> Runtime<T> for ServocatRuntime<T> {
     type EventLoopProxy = ServocatEventLoopProxy<T>;
 
     fn new(_args: RuntimeInitArgs) -> Result<Self> {
-        Ok(Self::default())
+        let event_loop = EventLoop::<RuntimeEvent<T>>::with_user_event()
+            .build()
+            .map_err(|_e| Error::CreateWindow)?;
+        let proxy = event_loop.create_proxy();
+        Ok(Self {
+            event_loop: Some(event_loop),
+            proxy,
+        })
     }
 
     fn create_proxy(&self) -> Self::EventLoopProxy {
-        ServocatEventLoopProxy::default()
+        ServocatEventLoopProxy {
+            proxy: self.proxy.clone(),
+        }
     }
 
     fn handle(&self) -> Self::Handle {
-        ServocatHandle::default()
+        ServocatHandle {
+            proxy: self.proxy.clone(),
+        }
     }
 
     fn create_window<F: Fn(RawWindow) + Send + 'static>(
         &self,
-        _pending: PendingWindow<T, Self>,
+        pending: PendingWindow<T, Self>,
         _after_window_creation: Option<F>,
     ) -> Result<DetachedWindow<T, Self>> {
-        Err(Error::CreateWindow)
+        queue_window(&self.proxy, pending)
     }
 
     fn create_webview(
@@ -433,18 +627,26 @@ impl<T: UserEvent> Runtime<T> for ServocatRuntime<T> {
     ))]
     fn run_iteration<F: FnMut(RunEvent<T>) + 'static>(&mut self, _callback: F) {}
 
-    fn run_return<F: FnMut(RunEvent<T>) + 'static>(self, _callback: F) -> i32 {
+    fn run_return<F: FnMut(RunEvent<T>) + 'static>(self, callback: F) -> i32 {
+        self.run(callback);
         0
     }
 
-    fn run<F: FnMut(RunEvent<T>) + 'static>(self, _callback: F) {}
+    fn run<F: FnMut(RunEvent<T>) + 'static>(mut self, callback: F) {
+        let _ = self.event_loop.take().map(|event_loop| {
+            let mut app = AppHandler::new(callback);
+            let _ = event_loop.run_app(&mut app);
+        });
+    }
 }
 
 impl<T: UserEvent> RuntimeHandle<T> for ServocatHandle<T> {
     type Runtime = ServocatRuntime<T>;
 
     fn create_proxy(&self) -> <Self::Runtime as Runtime<T>>::EventLoopProxy {
-        ServocatEventLoopProxy::default()
+        ServocatEventLoopProxy {
+            proxy: self.proxy.clone(),
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -460,16 +662,18 @@ impl<T: UserEvent> RuntimeHandle<T> for ServocatHandle<T> {
         Ok(())
     }
 
-    fn request_exit(&self, _code: i32) -> Result<()> {
-        Err(Error::EventLoopClosed)
+    fn request_exit(&self, code: i32) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::Exit { code })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn create_window<F: Fn(RawWindow) + Send + 'static>(
         &self,
-        _pending: PendingWindow<T, Self::Runtime>,
+        pending: PendingWindow<T, Self::Runtime>,
         _after_window_creation: Option<F>,
     ) -> Result<DetachedWindow<T, Self::Runtime>> {
-        Err(Error::CreateWindow)
+        queue_window(&self.proxy, pending)
     }
 
     fn create_webview(
@@ -544,7 +748,7 @@ impl<T: UserEvent> WindowDispatch<T> for ServocatWindowDispatch<T> {
         Err(Error::EventLoopClosed)
     }
 
-    fn on_window_event<F: Fn(&WindowEvent) + Send + 'static>(&self, _f: F) -> WindowEventId {
+    fn on_window_event<F: Fn(&TauriWindowEvent) + Send + 'static>(&self, _f: F) -> WindowEventId {
         0
     }
 
@@ -657,10 +861,10 @@ impl<T: UserEvent> WindowDispatch<T> for ServocatWindowDispatch<T> {
 
     fn create_window<F: Fn(RawWindow) + Send + 'static>(
         &mut self,
-        _pending: PendingWindow<T, Self::Runtime>,
+        pending: PendingWindow<T, Self::Runtime>,
         _after_window_creation: Option<F>,
     ) -> Result<DetachedWindow<T, Self::Runtime>> {
-        Err(Error::CreateWindow)
+        queue_window(&self.proxy, pending)
     }
 
     fn create_webview(
@@ -670,8 +874,13 @@ impl<T: UserEvent> WindowDispatch<T> for ServocatWindowDispatch<T> {
         Err(Error::CreateWebview(skeleton_error("create_webview")))
     }
 
-    fn set_resizable(&self, _resizable: bool) -> Result<()> {
-        Ok(())
+    fn set_resizable(&self, resizable: bool) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::SetResizable {
+                id: self.window_id,
+                resizable,
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn set_enabled(&self, _enabled: bool) -> Result<()> {
@@ -690,44 +899,70 @@ impl<T: UserEvent> WindowDispatch<T> for ServocatWindowDispatch<T> {
         Ok(())
     }
 
-    fn set_title<S: Into<String>>(&self, _title: S) -> Result<()> {
-        Ok(())
+    fn set_title<S: Into<String>>(&self, title: S) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::SetTitle {
+                id: self.window_id,
+                title: title.into(),
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn maximize(&self) -> Result<()> {
-        Ok(())
+        self.proxy
+            .send_event(RuntimeEvent::Maximize { id: self.window_id })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn unmaximize(&self) -> Result<()> {
-        Ok(())
+        self.proxy
+            .send_event(RuntimeEvent::Unmaximize { id: self.window_id })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn minimize(&self) -> Result<()> {
-        Ok(())
+        self.proxy
+            .send_event(RuntimeEvent::Minimize { id: self.window_id })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn unminimize(&self) -> Result<()> {
-        Ok(())
+        self.proxy
+            .send_event(RuntimeEvent::Unminimize { id: self.window_id })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn show(&self) -> Result<()> {
-        Ok(())
+        self.proxy
+            .send_event(RuntimeEvent::Show { id: self.window_id })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn hide(&self) -> Result<()> {
-        Ok(())
+        self.proxy
+            .send_event(RuntimeEvent::Hide { id: self.window_id })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn close(&self) -> Result<()> {
-        Ok(())
+        self.proxy
+            .send_event(RuntimeEvent::Close { id: self.window_id })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn destroy(&self) -> Result<()> {
-        Ok(())
+        self.proxy
+            .send_event(RuntimeEvent::Destroy { id: self.window_id })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
-    fn set_decorations(&self, _decorations: bool) -> Result<()> {
-        Ok(())
+    fn set_decorations(&self, decorations: bool) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::SetDecorations {
+                id: self.window_id,
+                decorations,
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn set_shadow(&self, _enable: bool) -> Result<()> {
@@ -754,8 +989,13 @@ impl<T: UserEvent> WindowDispatch<T> for ServocatWindowDispatch<T> {
         Ok(())
     }
 
-    fn set_size(&self, _size: Size) -> Result<()> {
-        Ok(())
+    fn set_size(&self, size: Size) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::SetSize {
+                id: self.window_id,
+                size,
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn set_min_size(&self, _size: Option<Size>) -> Result<()> {
@@ -770,12 +1010,22 @@ impl<T: UserEvent> WindowDispatch<T> for ServocatWindowDispatch<T> {
         Ok(())
     }
 
-    fn set_position(&self, _position: Position) -> Result<()> {
-        Ok(())
+    fn set_position(&self, position: Position) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::SetPosition {
+                id: self.window_id,
+                position,
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
-    fn set_fullscreen(&self, _fullscreen: bool) -> Result<()> {
-        Ok(())
+    fn set_fullscreen(&self, fullscreen: bool) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::SetFullscreen {
+                id: self.window_id,
+                fullscreen,
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     #[cfg(target_os = "macos")]
@@ -784,7 +1034,9 @@ impl<T: UserEvent> WindowDispatch<T> for ServocatWindowDispatch<T> {
     }
 
     fn set_focus(&self) -> Result<()> {
-        Ok(())
+        self.proxy
+            .send_event(RuntimeEvent::Focus { id: self.window_id })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn set_focusable(&self, _focusable: bool) -> Result<()> {
@@ -921,7 +1173,9 @@ impl<T: UserEvent> WebviewDispatch<T> for ServocatWebviewDispatch<T> {
     }
 
     fn close(&self) -> Result<()> {
-        Ok(())
+        self.proxy
+            .send_event(RuntimeEvent::Close { id: self.window_id })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn set_bounds(&self, _bounds: Rect) -> Result<()> {
@@ -937,7 +1191,9 @@ impl<T: UserEvent> WebviewDispatch<T> for ServocatWebviewDispatch<T> {
     }
 
     fn set_focus(&self) -> Result<()> {
-        Ok(())
+        self.proxy
+            .send_event(RuntimeEvent::Focus { id: self.window_id })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn hide(&self) -> Result<()> {
@@ -997,8 +1253,273 @@ impl<T: UserEvent> WebviewDispatch<T> for ServocatWebviewDispatch<T> {
     }
 }
 
+fn queue_window<T: UserEvent>(
+    proxy: &EventLoopProxy<RuntimeEvent<T>>,
+    pending: PendingWindow<T, ServocatRuntime<T>>,
+) -> Result<DetachedWindow<T, ServocatRuntime<T>>> {
+    let id = allocate_window_id();
+    let label = pending.label;
+    let attributes = pending.window_builder.clone();
+    proxy
+        .send_event(RuntimeEvent::CreateWindow {
+            id,
+            label: label.clone(),
+            attributes,
+        })
+        .map_err(|_e| Error::CreateWindow)?;
+    Ok(DetachedWindow {
+        id,
+        label,
+        dispatcher: ServocatWindowDispatch {
+            proxy: proxy.clone(),
+            window_id: id,
+            _marker: PhantomData,
+        },
+        webview: None,
+    })
+}
+
+struct AppHandler<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> {
+    callback: F,
+    windows: BTreeMap<u32, Window>,
+    labels: BTreeMap<u32, String>,
+    winit_to_tauri: BTreeMap<WinitWindowId, u32>,
+    ready_dispatched: bool,
+    _marker: PhantomData<fn() -> T>,
+}
+
+impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> AppHandler<T, F> {
+    fn new(callback: F) -> Self {
+        Self {
+            callback,
+            windows: BTreeMap::new(),
+            labels: BTreeMap::new(),
+            winit_to_tauri: BTreeMap::new(),
+            ready_dispatched: false,
+            _marker: PhantomData,
+        }
+    }
+
+    fn dispatch_window_event(&mut self, raw_id: u32, event: TauriWindowEvent) {
+        let label = self.labels.get(&raw_id).cloned().unwrap_or_default();
+        (self.callback)(RunEvent::WindowEvent { label, event });
+    }
+}
+
+impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEvent<T>>
+    for AppHandler<T, F>
+{
+    fn resumed(&mut self, _event_loop: &ActiveEventLoop) {
+        if !self.ready_dispatched {
+            (self.callback)(RunEvent::Ready);
+            self.ready_dispatched = true;
+        }
+        (self.callback)(RunEvent::Resumed);
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: RuntimeEvent<T>) {
+        match event {
+            RuntimeEvent::User(payload) => (self.callback)(RunEvent::UserEvent(payload)),
+            RuntimeEvent::CreateWindow {
+                id,
+                label,
+                attributes,
+            } => {
+                let raw = raw_window_id(id);
+                let attrs = attributes.to_winit_attributes();
+                let _ = event_loop.create_window(attrs).map(|window| {
+                    let winit_id = window.id();
+                    let _ = self.winit_to_tauri.insert(winit_id, raw);
+                    let _ = self.windows.insert(raw, window);
+                    let _ = self.labels.insert(raw, label);
+                });
+            }
+            RuntimeEvent::SetTitle { id, title } => {
+                let raw = raw_window_id(id);
+                let _ = self
+                    .windows
+                    .get(&raw)
+                    .map(|window| window.set_title(&title));
+            }
+            RuntimeEvent::SetSize { id, size } => {
+                let raw = raw_window_id(id);
+                let _ = self.windows.get(&raw).map(|window| match size {
+                    Size::Logical(s) => {
+                        let _ = window.request_inner_size(LogicalSize::new(s.width, s.height));
+                    }
+                    Size::Physical(s) => {
+                        let _ = window
+                            .request_inner_size(winit::dpi::PhysicalSize::new(s.width, s.height));
+                    }
+                });
+            }
+            RuntimeEvent::SetPosition { id, position } => {
+                let raw = raw_window_id(id);
+                let _ = self.windows.get(&raw).map(|window| match position {
+                    Position::Logical(p) => {
+                        window.set_outer_position(LogicalPosition::new(p.x, p.y));
+                    }
+                    Position::Physical(p) => {
+                        window.set_outer_position(WinitPhysicalPosition::new(p.x, p.y));
+                    }
+                });
+            }
+            RuntimeEvent::Show { id } => {
+                let raw = raw_window_id(id);
+                let _ = self
+                    .windows
+                    .get(&raw)
+                    .map(|window| window.set_visible(true));
+            }
+            RuntimeEvent::Hide { id } => {
+                let raw = raw_window_id(id);
+                let _ = self
+                    .windows
+                    .get(&raw)
+                    .map(|window| window.set_visible(false));
+            }
+            RuntimeEvent::Focus { id } => {
+                let raw = raw_window_id(id);
+                let _ = self.windows.get(&raw).map(Window::focus_window);
+            }
+            RuntimeEvent::Close { id } | RuntimeEvent::Destroy { id } => {
+                let raw = raw_window_id(id);
+                let _ = self.windows.remove(&raw).map(|window| {
+                    let winit_id = window.id();
+                    let _ = self.winit_to_tauri.remove(&winit_id);
+                    drop(window);
+                });
+                self.dispatch_window_event(raw, TauriWindowEvent::Destroyed);
+                let _ = self.labels.remove(&raw);
+            }
+            RuntimeEvent::Maximize { id } => {
+                let raw = raw_window_id(id);
+                let _ = self
+                    .windows
+                    .get(&raw)
+                    .map(|window| window.set_maximized(true));
+            }
+            RuntimeEvent::Unmaximize { id } => {
+                let raw = raw_window_id(id);
+                let _ = self
+                    .windows
+                    .get(&raw)
+                    .map(|window| window.set_maximized(false));
+            }
+            RuntimeEvent::Minimize { id } => {
+                let raw = raw_window_id(id);
+                let _ = self
+                    .windows
+                    .get(&raw)
+                    .map(|window| window.set_minimized(true));
+            }
+            RuntimeEvent::Unminimize { id } => {
+                let raw = raw_window_id(id);
+                let _ = self
+                    .windows
+                    .get(&raw)
+                    .map(|window| window.set_minimized(false));
+            }
+            RuntimeEvent::SetResizable { id, resizable } => {
+                let raw = raw_window_id(id);
+                let _ = self
+                    .windows
+                    .get(&raw)
+                    .map(|window| window.set_resizable(resizable));
+            }
+            RuntimeEvent::SetDecorations { id, decorations } => {
+                let raw = raw_window_id(id);
+                let _ = self
+                    .windows
+                    .get(&raw)
+                    .map(|window| window.set_decorations(decorations));
+            }
+            RuntimeEvent::SetFullscreen { id, fullscreen } => {
+                let raw = raw_window_id(id);
+                let _ = self.windows.get(&raw).map(|window| {
+                    let mode = fullscreen.then(|| Fullscreen::Borderless(None));
+                    window.set_fullscreen(mode);
+                });
+            }
+            RuntimeEvent::Exit { code: _ } => {
+                event_loop.exit();
+                (self.callback)(RunEvent::Exit);
+            }
+        }
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WinitWindowId,
+        event: WinitWindowEvent,
+    ) {
+        let raw_opt = self.winit_to_tauri.get(&window_id).copied();
+        match event {
+            WinitWindowEvent::CloseRequested => {
+                let _ = raw_opt.map(|raw| {
+                    let (signal_tx, signal_rx) = mpsc::channel::<bool>();
+                    self.dispatch_window_event(raw, TauriWindowEvent::CloseRequested { signal_tx });
+                    // Tauri's contract: receive cancellation request; if true,
+                    // keep the window open.  We poll once with try_recv and
+                    // default to closing.
+                    let prevent = signal_rx.try_recv().unwrap_or(false);
+                    if !prevent {
+                        let _ = self.windows.remove(&raw).map(|w| {
+                            let winit_id = w.id();
+                            let _ = self.winit_to_tauri.remove(&winit_id);
+                        });
+                        self.dispatch_window_event(raw, TauriWindowEvent::Destroyed);
+                        let _ = self.labels.remove(&raw);
+                        if self.windows.is_empty() {
+                            event_loop.exit();
+                        }
+                    }
+                });
+            }
+            WinitWindowEvent::Destroyed => {
+                let _ = raw_opt.map(|raw| {
+                    self.dispatch_window_event(raw, TauriWindowEvent::Destroyed);
+                    let _ = self.windows.remove(&raw);
+                    let _ = self.labels.remove(&raw);
+                });
+            }
+            WinitWindowEvent::Resized(size) => {
+                let _ = raw_opt.map(|raw| {
+                    self.dispatch_window_event(
+                        raw,
+                        TauriWindowEvent::Resized(PhysicalSize::new(size.width, size.height)),
+                    );
+                });
+            }
+            WinitWindowEvent::Moved(position) => {
+                let _ = raw_opt.map(|raw| {
+                    self.dispatch_window_event(
+                        raw,
+                        TauriWindowEvent::Moved(PhysicalPosition::new(position.x, position.y)),
+                    );
+                });
+            }
+            WinitWindowEvent::Focused(focused) => {
+                let _ = raw_opt.map(|raw| {
+                    self.dispatch_window_event(raw, TauriWindowEvent::Focused(focused));
+                });
+            }
+            _other => (),
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        (self.callback)(RunEvent::MainEventsCleared);
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        (self.callback)(RunEvent::Exit);
+    }
+}
+
 fn skeleton_error(method: &'static str) -> Box<dyn std::error::Error + Send + Sync> {
     Box::from(format!(
-        "tauri-runtime-servocat 1.0 skeleton: {method} not implemented"
+        "tauri-runtime-servocat 1.1 skeleton: {method} not implemented"
     ))
 }

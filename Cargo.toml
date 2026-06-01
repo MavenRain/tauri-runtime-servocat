@@ -1,8 +1,8 @@
 [package]
 name = "tauri-runtime-servocat"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
-description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v1.0.0 implements the `tauri_runtime::Runtime` trait surface (Runtime, RuntimeHandle, WindowDispatch, WebviewDispatch, EventLoopProxy, WindowBuilder) as a stub-heavy skeleton so it can be plugged into a Tauri app; non-cosmetic methods return `tauri_runtime::Error` and will be filled in over the 1.x patch series.  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
+description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v1.1.0 backs the `tauri_runtime::Runtime` trait surface with a real winit event loop: `Runtime::run` consumes the event loop and opens any windows that were queued via `Runtime::create_window`; `WindowDispatch::set_title` / `show` / `hide` / `close` / `set_size` / `set_position` send commands to the loop via a winit `EventLoopProxy`.  The remaining stub-heavy methods continue to return `tauri_runtime::Error` until later 1.x patch releases.  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
 license = "MIT OR Apache-2.0"
 keywords = ["tauri", "runtime", "browser", "servo", "type-driven"]
 categories = ["gui", "rendering"]
