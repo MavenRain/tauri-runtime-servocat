@@ -1,6 +1,7 @@
-//! v1.1 implementation of the `tauri_runtime::Runtime` trait surface.
+//! v1.2 implementation of the `tauri_runtime::Runtime` trait surface.
 //!
-//! Backed by a real winit event loop:
+//! Backed by a real winit event loop with per-window softbuffer
+//! presentation:
 //!
 //! - [`ServocatRuntime::new`] creates a winit [`EventLoop`] with our
 //!   internal [`RuntimeEvent<T>`] payload.
@@ -8,18 +9,29 @@
 //!   `RuntimeEvent::CreateWindow` through the proxy; the actual winit
 //!   window is constructed inside the event-loop handler when the
 //!   event is delivered.
+//! - [`Runtime::create_webview`] sends a `RuntimeEvent::CreateWebview`
+//!   for the window; the handler parses the URL (currently
+//!   `data:text/html,...`), runs the cat-stack pipeline, and stores
+//!   the resulting [`Frame`] plus a reusable [`TextRenderer`] in a
+//!   per-window [`WebviewState`].
+//! - [`WebviewDispatch::navigate`] sends `Navigate`, replacing the
+//!   stored HTML and rebuilding the frame.
+//!   [`WebviewDispatch::reload`] re-runs the pipeline against the
+//!   cached HTML/CSS.  [`WebviewDispatch::eval_script`] runs the
+//!   script via `run_script_with_backprop`, back-propagates DOM
+//!   mutations into layout, and stores the new frame.
 //! - [`Runtime::run`] consumes the event loop and drives an
-//!   [`ApplicationHandler`] that creates queued windows, routes winit
+//!   [`ApplicationHandler`] that creates queued windows, paints the
+//!   webview frame on `RedrawRequested` via softbuffer, routes winit
 //!   `WindowEvent`s to `tauri_runtime::WindowEvent`s, and forwards
 //!   user-defined events.
 //! - [`WindowDispatch::set_title`] / [`set_size`] / [`set_position`] /
 //!   [`show`] / [`hide`] / [`close`] / [`set_focus`] / [`maximize`] /
 //!   [`unmaximize`] / [`minimize`] / [`unminimize`] / [`set_resizable`] /
 //!   [`set_decorations`] / [`set_fullscreen`] send their commands
-//!   through the proxy.  Other [`WindowDispatch`] methods (getters
-//!   that need to inspect window state from another thread, anything
-//!   webview-shaped, IME / cursor positioning) still return errors or
-//!   no-op zero values and are slated for 1.2+.
+//!   through the proxy.  Most [`WindowDispatch`] / [`WebviewDispatch`]
+//!   getters still return zero values; per-window state query
+//!   round-trips arrive in 1.3+.
 //!
 //! [`Runtime`]: tauri_runtime::Runtime
 //! [`Runtime::create_window`]: tauri_runtime::Runtime::create_window
@@ -51,11 +63,13 @@
 
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 
 use cookie::Cookie;
 use raw_window_handle::{DisplayHandle, HandleError, WindowHandle};
+use softbuffer::{Context, Surface};
 use tauri_runtime::dpi::{PhysicalPosition, PhysicalSize, Position, Rect, Size};
 use tauri_runtime::monitor::Monitor;
 use tauri_runtime::webview::{DetachedWebview, PendingWebview};
@@ -76,6 +90,13 @@ use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition as WinitPhysical
 use winit::event::WindowEvent as WinitWindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::window::{Fullscreen, Window, WindowAttributes, WindowId as WinitWindowId};
+
+use crate::frame::Frame;
+use crate::ipc::HostCommands;
+use crate::raster::{PixelBuffer, render_to_pixels_with};
+use crate::script::run_script_with_backprop;
+use crate::text::TextRenderer;
+use layout_cat::Viewport;
 
 static NEXT_WINDOW_ID: AtomicU32 = AtomicU32::new(1);
 
@@ -139,6 +160,26 @@ pub enum RuntimeEvent<T: UserEvent> {
     SetDecorations { id: WindowId, decorations: bool },
     /// Updates the fullscreen flag of an existing window.
     SetFullscreen { id: WindowId, fullscreen: bool },
+    /// Attaches a webview to an existing window with the given URL.
+    /// The runtime will parse the URL (currently `data:text/html,...`),
+    /// build the cat-stack pipeline, and present the resulting frame
+    /// into the window via softbuffer.
+    CreateWebview {
+        window_id: WindowId,
+        label: String,
+        url: String,
+    },
+    /// Navigates the webview attached to a window to a new URL.  The
+    /// runtime re-builds the pipeline against the new content and
+    /// requests a redraw.
+    Navigate { window_id: WindowId, url: String },
+    /// Reloads the webview attached to a window (re-builds the
+    /// pipeline against the cached HTML/CSS and requests a redraw).
+    Reload { window_id: WindowId },
+    /// Runs a JS expression against the webview attached to a window
+    /// via `run_script_with_backprop`, back-propagates DOM mutations
+    /// into layout, and requests a redraw.
+    EvalScript { window_id: WindowId, script: String },
     /// Asks the runtime to exit with the given code.
     Exit { code: i32 },
 }
@@ -578,10 +619,10 @@ impl<T: UserEvent> Runtime<T> for ServocatRuntime<T> {
 
     fn create_webview(
         &self,
-        _window_id: WindowId,
-        _pending: PendingWebview<T, Self>,
+        window_id: WindowId,
+        pending: PendingWebview<T, Self>,
     ) -> Result<DetachedWebview<T, Self>> {
-        Err(Error::CreateWebview(skeleton_error("create_webview")))
+        queue_webview(&self.proxy, window_id, pending)
     }
 
     fn primary_monitor(&self) -> Option<Monitor> {
@@ -678,10 +719,10 @@ impl<T: UserEvent> RuntimeHandle<T> for ServocatHandle<T> {
 
     fn create_webview(
         &self,
-        _window_id: WindowId,
-        _pending: PendingWebview<T, Self::Runtime>,
+        window_id: WindowId,
+        pending: PendingWebview<T, Self::Runtime>,
     ) -> Result<DetachedWebview<T, Self::Runtime>> {
-        Err(Error::CreateWebview(skeleton_error("create_webview")))
+        queue_webview(&self.proxy, window_id, pending)
     }
 
     fn run_on_main_thread<F: FnOnce() + Send + 'static>(&self, _f: F) -> Result<()> {
@@ -869,9 +910,9 @@ impl<T: UserEvent> WindowDispatch<T> for ServocatWindowDispatch<T> {
 
     fn create_webview(
         &mut self,
-        _pending: PendingWebview<T, Self::Runtime>,
+        pending: PendingWebview<T, Self::Runtime>,
     ) -> Result<DetachedWebview<T, Self::Runtime>> {
-        Err(Error::CreateWebview(skeleton_error("create_webview")))
+        queue_webview(&self.proxy, self.window_id, pending)
     }
 
     fn set_resizable(&self, resizable: bool) -> Result<()> {
@@ -1160,12 +1201,21 @@ impl<T: UserEvent> WebviewDispatch<T> for ServocatWebviewDispatch<T> {
         Ok(PhysicalSize::new(0, 0))
     }
 
-    fn navigate(&self, _url: Url) -> Result<()> {
-        Err(Error::FailedToSendMessage)
+    fn navigate(&self, url: Url) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::Navigate {
+                window_id: self.window_id,
+                url: url.into(),
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn reload(&self) -> Result<()> {
-        Err(Error::FailedToSendMessage)
+        self.proxy
+            .send_event(RuntimeEvent::Reload {
+                window_id: self.window_id,
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn print(&self) -> Result<()> {
@@ -1204,16 +1254,29 @@ impl<T: UserEvent> WebviewDispatch<T> for ServocatWebviewDispatch<T> {
         Ok(())
     }
 
-    fn eval_script<S: Into<String>>(&self, _script: S) -> Result<()> {
-        Err(Error::FailedToSendMessage)
+    fn eval_script<S: Into<String>>(&self, script: S) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::EvalScript {
+                window_id: self.window_id,
+                script: script.into(),
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn eval_script_with_callback<S: Into<String>>(
         &self,
-        _script: S,
+        script: S,
         _callback: impl Fn(String) + Send + 'static,
     ) -> Result<()> {
-        Err(Error::FailedToSendMessage)
+        // The callback is dropped in v1.2; we'll surface eval results
+        // through it once the AppHandler grows a reply channel
+        // (planned for v1.3).
+        self.proxy
+            .send_event(RuntimeEvent::EvalScript {
+                window_id: self.window_id,
+                script: script.into(),
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn reparent(&self, _window_id: WindowId) -> Result<()> {
@@ -1279,11 +1342,99 @@ fn queue_window<T: UserEvent>(
     })
 }
 
+fn queue_webview<T: UserEvent>(
+    proxy: &EventLoopProxy<RuntimeEvent<T>>,
+    window_id: WindowId,
+    pending: PendingWebview<T, ServocatRuntime<T>>,
+) -> Result<DetachedWebview<T, ServocatRuntime<T>>> {
+    let label = pending.label;
+    proxy
+        .send_event(RuntimeEvent::CreateWebview {
+            window_id,
+            label: label.clone(),
+            url: pending.url,
+        })
+        .map_err(|err| Error::CreateWebview(skeleton_error_from(err.to_string())))?;
+    Ok(DetachedWebview {
+        label,
+        dispatcher: ServocatWebviewDispatch {
+            proxy: proxy.clone(),
+            window_id,
+            _marker: PhantomData,
+        },
+    })
+}
+
+/// Per-window webview state held by [`AppHandler`].  v1.2 keeps the
+/// caller-supplied HTML/CSS so `reload` + `eval_script` can rebuild
+/// the pipeline without re-fetching.
+struct WebviewState {
+    html: String,
+    css: String,
+    viewport: Viewport,
+    current_frame: Option<Frame>,
+    text_renderer: TextRenderer,
+}
+
+impl WebviewState {
+    fn new(html: String, viewport: Viewport) -> Self {
+        Self {
+            html,
+            css: String::new(),
+            viewport,
+            current_frame: None,
+            text_renderer: TextRenderer::new(),
+        }
+    }
+
+    fn rebuild_frame(&mut self) {
+        self.current_frame = crate::pipeline::render(&self.html, &self.css, self.viewport).ok();
+    }
+
+    fn eval(&mut self, script: &str) {
+        self.current_frame = run_script_with_backprop(
+            &self.html,
+            &self.css,
+            script,
+            self.viewport,
+            &HostCommands::new(),
+        )
+        .ok();
+    }
+}
+
+/// Extract a usable HTML body from a URL.  Currently handles
+/// `data:text/html,<body>` (with optional `;charset=utf-8` /
+/// `;base64` params dropped); everything else falls back to a
+/// placeholder body containing the URL.  Percent-decoding is
+/// intentionally not done in v1.2 -- pass literal HTML in the data
+/// URL body.
+fn html_from_url(url: &str) -> String {
+    let parsed = url::Url::parse(url).ok();
+    let from_data = parsed
+        .as_ref()
+        .filter(|u| u.scheme() == "data")
+        .and_then(|u| u.path().split_once(','))
+        .map(|(_mime, body)| body.to_owned());
+    from_data.unwrap_or_else(|| {
+        format!(
+            "<html><body><h1>tauri-runtime-servocat</h1>\
+             <p>Unsupported URL scheme.  v1.2 handles \
+             <code>data:text/html,...</code>; got: {url}</p></body></html>"
+        )
+    })
+}
+
+fn skeleton_error_from(msg: String) -> Box<dyn std::error::Error + Send + Sync> {
+    Box::from(msg)
+}
+
 struct AppHandler<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> {
     callback: F,
     windows: BTreeMap<u32, Window>,
     labels: BTreeMap<u32, String>,
     winit_to_tauri: BTreeMap<WinitWindowId, u32>,
+    webviews: BTreeMap<u32, WebviewState>,
     ready_dispatched: bool,
     _marker: PhantomData<fn() -> T>,
 }
@@ -1295,6 +1446,7 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> AppHandler<T, F> {
             windows: BTreeMap::new(),
             labels: BTreeMap::new(),
             winit_to_tauri: BTreeMap::new(),
+            webviews: BTreeMap::new(),
             ready_dispatched: false,
             _marker: PhantomData,
         }
@@ -1304,6 +1456,58 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> AppHandler<T, F> {
         let label = self.labels.get(&raw_id).cloned().unwrap_or_default();
         (self.callback)(RunEvent::WindowEvent { label, event });
     }
+
+    fn request_redraw(&self, raw_id: u32) {
+        let _ = self.windows.get(&raw_id).map(Window::request_redraw);
+    }
+
+    fn present(&mut self, raw_id: u32) {
+        let window_opt = self.windows.get(&raw_id);
+        let webview_opt = self.webviews.get_mut(&raw_id);
+        let _ = window_opt
+            .zip(webview_opt)
+            .and_then(|(window, webview)| present_webview(window, webview));
+    }
+}
+
+fn present_webview(window: &Window, webview: &mut WebviewState) -> Option<()> {
+    let size = window.inner_size();
+    let width = NonZeroU32::new(size.width)?;
+    let height = NonZeroU32::new(size.height)?;
+    let frame = webview.current_frame.as_ref()?;
+    let pixels = render_to_pixels_with(frame, size.width, size.height, &mut webview.text_renderer);
+    let context = Context::new(window).ok()?;
+    // FFI carve-out: softbuffer's `Surface` / `Buffer` require `&mut`
+    // for `resize`, `buffer_mut`, and `present`.
+    let mut surface = Surface::new(&context, window).ok()?;
+    surface.resize(width, height).ok()?;
+    let mut buffer = surface.buffer_mut().ok()?;
+    write_pixels(&pixels, &mut buffer);
+    buffer.present().ok()?;
+    Some(())
+}
+
+fn write_pixels(pixels: &PixelBuffer, buffer: &mut softbuffer::Buffer<'_, &Window, &Window>) {
+    pixels
+        .rgba()
+        .chunks_exact(4)
+        .map(rgba_to_softbuffer_word)
+        .zip(buffer.iter_mut())
+        .for_each(|(word, slot)| *slot = word);
+}
+
+fn rgba_to_softbuffer_word(chunk: &[u8]) -> u32 {
+    let red = chunk.first().copied().unwrap_or(0);
+    let green = chunk.get(1).copied().unwrap_or(0);
+    let blue = chunk.get(2).copied().unwrap_or(0);
+    let alpha = chunk.get(3).copied().unwrap_or(0);
+    // Composite premultiplied RGBA over a solid white background:
+    //   out = src + (1 - src_a) * dst  with dst = (1,1,1)
+    let inv = 255_u8 - alpha;
+    let out_r = red.saturating_add(inv);
+    let out_g = green.saturating_add(inv);
+    let out_b = blue.saturating_add(inv);
+    (u32::from(out_r) << 16) | (u32::from(out_g) << 8) | u32::from(out_b)
 }
 
 impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEvent<T>>
@@ -1441,6 +1645,47 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                     window.set_fullscreen(mode);
                 });
             }
+            RuntimeEvent::CreateWebview {
+                window_id,
+                label: _label,
+                url,
+            } => {
+                let raw = raw_window_id(window_id);
+                let viewport = self.windows.get(&raw).map_or_else(
+                    || Viewport::new(800, 600),
+                    |window| {
+                        let size = window.inner_size();
+                        Viewport::new(size.width, size.height)
+                    },
+                );
+                let html = html_from_url(&url);
+                let mut state = WebviewState::new(html, viewport);
+                state.rebuild_frame();
+                let _ = self.webviews.insert(raw, state);
+                self.request_redraw(raw);
+            }
+            RuntimeEvent::Navigate { window_id, url } => {
+                let raw = raw_window_id(window_id);
+                let html = html_from_url(&url);
+                let _ = self.webviews.get_mut(&raw).map(|webview| {
+                    webview.html = html;
+                    webview.rebuild_frame();
+                });
+                self.request_redraw(raw);
+            }
+            RuntimeEvent::Reload { window_id } => {
+                let raw = raw_window_id(window_id);
+                let _ = self.webviews.get_mut(&raw).map(WebviewState::rebuild_frame);
+                self.request_redraw(raw);
+            }
+            RuntimeEvent::EvalScript { window_id, script } => {
+                let raw = raw_window_id(window_id);
+                let _ = self
+                    .webviews
+                    .get_mut(&raw)
+                    .map(|webview| webview.eval(&script));
+                self.request_redraw(raw);
+            }
             RuntimeEvent::Exit { code: _ } => {
                 event_loop.exit();
                 (self.callback)(RunEvent::Exit);
@@ -1505,6 +1750,27 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                     self.dispatch_window_event(raw, TauriWindowEvent::Focused(focused));
                 });
             }
+            WinitWindowEvent::RedrawRequested => {
+                let _ = raw_opt.map(|raw| self.present(raw));
+            }
+            WinitWindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                let _ = raw_opt.map(|raw| {
+                    let new_inner = self.windows.get(&raw).map_or_else(
+                        || PhysicalSize::new(0, 0),
+                        |window| {
+                            let size = window.inner_size();
+                            PhysicalSize::new(size.width, size.height)
+                        },
+                    );
+                    self.dispatch_window_event(
+                        raw,
+                        TauriWindowEvent::ScaleFactorChanged {
+                            scale_factor,
+                            new_inner_size: new_inner,
+                        },
+                    );
+                });
+            }
             _other => (),
         }
     }
@@ -1516,10 +1782,4 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         (self.callback)(RunEvent::Exit);
     }
-}
-
-fn skeleton_error(method: &'static str) -> Box<dyn std::error::Error + Send + Sync> {
-    Box::from(format!(
-        "tauri-runtime-servocat 1.1 skeleton: {method} not implemented"
-    ))
 }
