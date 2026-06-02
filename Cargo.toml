@@ -1,8 +1,8 @@
 [package]
 name = "tauri-runtime-servocat"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2024"
-description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v1.2.0 wires `Runtime::create_webview` / `WebviewDispatch::navigate` / `WebviewDispatch::eval_script` through the cat-stack pipeline + softbuffer presentation, so a Tauri app's webview-side calls actually render pages and run JS through boa-cat against the open window.  Navigation handles `data:text/html,...` URLs; eval_script back-propagates DOM mutations into the layout pass and triggers a redraw.  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
+description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v1.3.0 round-trips state-query methods on `WindowDispatch` (inner_size / outer_size / scale_factor / title / is_visible / is_focused / is_maximized / is_minimized / is_fullscreen / theme / ...) through the event loop via reply channels, so callers see real values from the live winit window instead of zero placeholders; `WebviewDispatch::eval_script_with_callback` now delivers the JS return value back through the supplied callback.  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
 license = "MIT OR Apache-2.0"
 keywords = ["tauri", "runtime", "browser", "servo", "type-driven"]
 categories = ["gui", "rendering"]

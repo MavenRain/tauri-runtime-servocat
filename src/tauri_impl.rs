@@ -1,4 +1,4 @@
-//! v1.2 implementation of the `tauri_runtime::Runtime` trait surface.
+//! v1.3 implementation of the `tauri_runtime::Runtime` trait surface.
 //!
 //! Backed by a real winit event loop with per-window softbuffer
 //! presentation:
@@ -66,6 +66,7 @@ use std::marker::PhantomData;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
+use std::time::Duration;
 
 use cookie::Cookie;
 use raw_window_handle::{DisplayHandle, HandleError, WindowHandle};
@@ -119,7 +120,10 @@ fn raw_window_id(id: WindowId) -> u32 {
 /// Cross-thread message sent through the winit `EventLoopProxy` to
 /// command the runtime from another thread (a [`ServocatHandle`] /
 /// [`ServocatWindowDispatch`] / [`ServocatWebviewDispatch`]).
-#[derive(Debug, Clone)]
+///
+/// Not `Clone` (carries `mpsc::Sender` reply handles and a
+/// `Box<dyn Fn>` callback for `EvalScriptWithCallback`).  `Debug` is
+/// hand-rolled to print just the variant name.
 pub enum RuntimeEvent<T: UserEvent> {
     /// A user-defined event surfaced through `Runtime::run`'s callback.
     User(T),
@@ -180,8 +184,131 @@ pub enum RuntimeEvent<T: UserEvent> {
     /// via `run_script_with_backprop`, back-propagates DOM mutations
     /// into layout, and requests a redraw.
     EvalScript { window_id: WindowId, script: String },
+    /// Like [`Self::EvalScript`] but also delivers a string-formatted
+    /// representation of the script's return value back through the
+    /// supplied callback after the eval completes.
+    EvalScriptWithCallback {
+        window_id: WindowId,
+        script: String,
+        callback: Box<dyn Fn(String) + Send + 'static>,
+    },
+    /// Asks the handler for the inner (client area) size of a window.
+    QueryInnerSize {
+        id: WindowId,
+        reply: mpsc::Sender<PhysicalSize<u32>>,
+    },
+    /// Asks the handler for the outer (full window) size of a window.
+    QueryOuterSize {
+        id: WindowId,
+        reply: mpsc::Sender<PhysicalSize<u32>>,
+    },
+    /// Asks the handler for the inner position of a window.
+    QueryInnerPosition {
+        id: WindowId,
+        reply: mpsc::Sender<PhysicalPosition<i32>>,
+    },
+    /// Asks the handler for the outer position of a window.
+    QueryOuterPosition {
+        id: WindowId,
+        reply: mpsc::Sender<PhysicalPosition<i32>>,
+    },
+    /// Asks the handler for the scale factor of a window.
+    QueryScaleFactor {
+        id: WindowId,
+        reply: mpsc::Sender<f64>,
+    },
+    /// Asks the handler for the title of a window.
+    QueryTitle {
+        id: WindowId,
+        reply: mpsc::Sender<String>,
+    },
+    /// Asks the handler whether a window is currently visible.
+    QueryIsVisible {
+        id: WindowId,
+        reply: mpsc::Sender<bool>,
+    },
+    /// Asks the handler whether a window currently has focus.
+    QueryIsFocused {
+        id: WindowId,
+        reply: mpsc::Sender<bool>,
+    },
+    /// Asks the handler whether a window is currently maximized.
+    QueryIsMaximized {
+        id: WindowId,
+        reply: mpsc::Sender<bool>,
+    },
+    /// Asks the handler whether a window is currently minimized.
+    QueryIsMinimized {
+        id: WindowId,
+        reply: mpsc::Sender<bool>,
+    },
+    /// Asks the handler whether a window is currently in fullscreen.
+    QueryIsFullscreen {
+        id: WindowId,
+        reply: mpsc::Sender<bool>,
+    },
+    /// Asks the handler whether a window is currently decorated.
+    QueryIsDecorated {
+        id: WindowId,
+        reply: mpsc::Sender<bool>,
+    },
+    /// Asks the handler whether a window is currently resizable.
+    QueryIsResizable {
+        id: WindowId,
+        reply: mpsc::Sender<bool>,
+    },
+    /// Asks the handler for the theme of a window.
+    QueryTheme {
+        id: WindowId,
+        reply: mpsc::Sender<Theme>,
+    },
     /// Asks the runtime to exit with the given code.
     Exit { code: i32 },
+}
+
+impl<T: UserEvent> std::fmt::Debug for RuntimeEvent<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::User(_) => "User",
+            Self::CreateWindow { .. } => "CreateWindow",
+            Self::SetTitle { .. } => "SetTitle",
+            Self::SetSize { .. } => "SetSize",
+            Self::SetPosition { .. } => "SetPosition",
+            Self::Show { .. } => "Show",
+            Self::Hide { .. } => "Hide",
+            Self::Focus { .. } => "Focus",
+            Self::Close { .. } => "Close",
+            Self::Destroy { .. } => "Destroy",
+            Self::Maximize { .. } => "Maximize",
+            Self::Unmaximize { .. } => "Unmaximize",
+            Self::Minimize { .. } => "Minimize",
+            Self::Unminimize { .. } => "Unminimize",
+            Self::SetResizable { .. } => "SetResizable",
+            Self::SetDecorations { .. } => "SetDecorations",
+            Self::SetFullscreen { .. } => "SetFullscreen",
+            Self::CreateWebview { .. } => "CreateWebview",
+            Self::Navigate { .. } => "Navigate",
+            Self::Reload { .. } => "Reload",
+            Self::EvalScript { .. } => "EvalScript",
+            Self::EvalScriptWithCallback { .. } => "EvalScriptWithCallback",
+            Self::QueryInnerSize { .. } => "QueryInnerSize",
+            Self::QueryOuterSize { .. } => "QueryOuterSize",
+            Self::QueryInnerPosition { .. } => "QueryInnerPosition",
+            Self::QueryOuterPosition { .. } => "QueryOuterPosition",
+            Self::QueryScaleFactor { .. } => "QueryScaleFactor",
+            Self::QueryTitle { .. } => "QueryTitle",
+            Self::QueryIsVisible { .. } => "QueryIsVisible",
+            Self::QueryIsFocused { .. } => "QueryIsFocused",
+            Self::QueryIsMaximized { .. } => "QueryIsMaximized",
+            Self::QueryIsMinimized { .. } => "QueryIsMinimized",
+            Self::QueryIsFullscreen { .. } => "QueryIsFullscreen",
+            Self::QueryIsDecorated { .. } => "QueryIsDecorated",
+            Self::QueryIsResizable { .. } => "QueryIsResizable",
+            Self::QueryTheme { .. } => "QueryTheme",
+            Self::Exit { .. } => "Exit",
+        };
+        formatter.write_str(name)
+    }
 }
 
 /// The Servocat runtime.  Owns the winit event loop until
@@ -794,47 +921,80 @@ impl<T: UserEvent> WindowDispatch<T> for ServocatWindowDispatch<T> {
     }
 
     fn scale_factor(&self) -> Result<f64> {
-        Ok(1.0)
+        query(&self.proxy, |reply| RuntimeEvent::QueryScaleFactor {
+            id: self.window_id,
+            reply,
+        })
     }
 
     fn inner_position(&self) -> Result<PhysicalPosition<i32>> {
-        Ok(PhysicalPosition::new(0, 0))
+        query(&self.proxy, |reply| RuntimeEvent::QueryInnerPosition {
+            id: self.window_id,
+            reply,
+        })
     }
 
     fn outer_position(&self) -> Result<PhysicalPosition<i32>> {
-        Ok(PhysicalPosition::new(0, 0))
+        query(&self.proxy, |reply| RuntimeEvent::QueryOuterPosition {
+            id: self.window_id,
+            reply,
+        })
     }
 
     fn inner_size(&self) -> Result<PhysicalSize<u32>> {
-        Ok(PhysicalSize::new(0, 0))
+        query(&self.proxy, |reply| RuntimeEvent::QueryInnerSize {
+            id: self.window_id,
+            reply,
+        })
     }
 
     fn outer_size(&self) -> Result<PhysicalSize<u32>> {
-        Ok(PhysicalSize::new(0, 0))
+        query(&self.proxy, |reply| RuntimeEvent::QueryOuterSize {
+            id: self.window_id,
+            reply,
+        })
     }
 
     fn is_fullscreen(&self) -> Result<bool> {
-        Ok(false)
+        query(&self.proxy, |reply| RuntimeEvent::QueryIsFullscreen {
+            id: self.window_id,
+            reply,
+        })
     }
 
     fn is_minimized(&self) -> Result<bool> {
-        Ok(false)
+        query(&self.proxy, |reply| RuntimeEvent::QueryIsMinimized {
+            id: self.window_id,
+            reply,
+        })
     }
 
     fn is_maximized(&self) -> Result<bool> {
-        Ok(false)
+        query(&self.proxy, |reply| RuntimeEvent::QueryIsMaximized {
+            id: self.window_id,
+            reply,
+        })
     }
 
     fn is_focused(&self) -> Result<bool> {
-        Ok(false)
+        query(&self.proxy, |reply| RuntimeEvent::QueryIsFocused {
+            id: self.window_id,
+            reply,
+        })
     }
 
     fn is_decorated(&self) -> Result<bool> {
-        Ok(false)
+        query(&self.proxy, |reply| RuntimeEvent::QueryIsDecorated {
+            id: self.window_id,
+            reply,
+        })
     }
 
     fn is_resizable(&self) -> Result<bool> {
-        Ok(false)
+        query(&self.proxy, |reply| RuntimeEvent::QueryIsResizable {
+            id: self.window_id,
+            reply,
+        })
     }
 
     fn is_maximizable(&self) -> Result<bool> {
@@ -850,7 +1010,10 @@ impl<T: UserEvent> WindowDispatch<T> for ServocatWindowDispatch<T> {
     }
 
     fn is_visible(&self) -> Result<bool> {
-        Ok(false)
+        query(&self.proxy, |reply| RuntimeEvent::QueryIsVisible {
+            id: self.window_id,
+            reply,
+        })
     }
 
     fn is_enabled(&self) -> Result<bool> {
@@ -862,7 +1025,10 @@ impl<T: UserEvent> WindowDispatch<T> for ServocatWindowDispatch<T> {
     }
 
     fn title(&self) -> Result<String> {
-        Ok(String::new())
+        query(&self.proxy, |reply| RuntimeEvent::QueryTitle {
+            id: self.window_id,
+            reply,
+        })
     }
 
     fn current_monitor(&self) -> Result<Option<Monitor>> {
@@ -886,7 +1052,10 @@ impl<T: UserEvent> WindowDispatch<T> for ServocatWindowDispatch<T> {
     }
 
     fn theme(&self) -> Result<Theme> {
-        Ok(Theme::Light)
+        query(&self.proxy, |reply| RuntimeEvent::QueryTheme {
+            id: self.window_id,
+            reply,
+        })
     }
 
     fn center(&self) -> Result<()> {
@@ -1266,15 +1435,13 @@ impl<T: UserEvent> WebviewDispatch<T> for ServocatWebviewDispatch<T> {
     fn eval_script_with_callback<S: Into<String>>(
         &self,
         script: S,
-        _callback: impl Fn(String) + Send + 'static,
+        callback: impl Fn(String) + Send + 'static,
     ) -> Result<()> {
-        // The callback is dropped in v1.2; we'll surface eval results
-        // through it once the AppHandler grows a reply channel
-        // (planned for v1.3).
         self.proxy
-            .send_event(RuntimeEvent::EvalScript {
+            .send_event(RuntimeEvent::EvalScriptWithCallback {
                 window_id: self.window_id,
                 script: script.into(),
+                callback: Box::new(callback),
             })
             .map_err(|_e| Error::EventLoopClosed)
     }
@@ -1342,6 +1509,23 @@ fn queue_window<T: UserEvent>(
     })
 }
 
+/// Block the calling thread waiting for a reply from the event loop.
+/// Used by [`WindowDispatch`] getters to round-trip a query through
+/// the handler and back.
+fn query<T, R, F>(proxy: &EventLoopProxy<RuntimeEvent<T>>, builder: F) -> Result<R>
+where
+    T: UserEvent,
+    R: Send + 'static,
+    F: FnOnce(mpsc::Sender<R>) -> RuntimeEvent<T>,
+{
+    let (tx, rx) = mpsc::channel::<R>();
+    proxy
+        .send_event(builder(tx))
+        .map_err(|_e| Error::EventLoopClosed)?;
+    rx.recv_timeout(Duration::from_millis(500))
+        .map_err(|_e| Error::FailedToReceiveMessage)
+}
+
 fn queue_webview<T: UserEvent>(
     proxy: &EventLoopProxy<RuntimeEvent<T>>,
     window_id: WindowId,
@@ -1391,15 +1575,18 @@ impl WebviewState {
         self.current_frame = crate::pipeline::render(&self.html, &self.css, self.viewport).ok();
     }
 
-    fn eval(&mut self, script: &str) {
-        self.current_frame = run_script_with_backprop(
+    fn eval(&mut self, script: &str) -> Option<String> {
+        let frame = run_script_with_backprop(
             &self.html,
             &self.css,
             script,
             self.viewport,
             &HostCommands::new(),
         )
-        .ok();
+        .ok()?;
+        let value = format!("{}", frame.script_value());
+        self.current_frame = Some(frame);
+        Some(value)
     }
 }
 
@@ -1685,6 +1872,154 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                     .get_mut(&raw)
                     .map(|webview| webview.eval(&script));
                 self.request_redraw(raw);
+            }
+            RuntimeEvent::EvalScriptWithCallback {
+                window_id,
+                script,
+                callback,
+            } => {
+                let raw = raw_window_id(window_id);
+                let result = self
+                    .webviews
+                    .get_mut(&raw)
+                    .and_then(|webview| webview.eval(&script))
+                    .unwrap_or_default();
+                callback(result);
+                self.request_redraw(raw);
+            }
+            RuntimeEvent::QueryInnerSize { id, reply } => {
+                let raw = raw_window_id(id);
+                let size = self.windows.get(&raw).map_or_else(
+                    || PhysicalSize::new(0, 0),
+                    |window| {
+                        let s = window.inner_size();
+                        PhysicalSize::new(s.width, s.height)
+                    },
+                );
+                let _ = reply.send(size);
+            }
+            RuntimeEvent::QueryOuterSize { id, reply } => {
+                let raw = raw_window_id(id);
+                let size = self.windows.get(&raw).map_or_else(
+                    || PhysicalSize::new(0, 0),
+                    |window| {
+                        let s = window.outer_size();
+                        PhysicalSize::new(s.width, s.height)
+                    },
+                );
+                let _ = reply.send(size);
+            }
+            RuntimeEvent::QueryInnerPosition { id, reply } => {
+                let raw = raw_window_id(id);
+                let position = self.windows.get(&raw).map_or_else(
+                    || PhysicalPosition::new(0, 0),
+                    |window| {
+                        window.inner_position().map_or_else(
+                            |_e| PhysicalPosition::new(0, 0),
+                            |p| PhysicalPosition::new(p.x, p.y),
+                        )
+                    },
+                );
+                let _ = reply.send(position);
+            }
+            RuntimeEvent::QueryOuterPosition { id, reply } => {
+                let raw = raw_window_id(id);
+                let position = self.windows.get(&raw).map_or_else(
+                    || PhysicalPosition::new(0, 0),
+                    |window| {
+                        window.outer_position().map_or_else(
+                            |_e| PhysicalPosition::new(0, 0),
+                            |p| PhysicalPosition::new(p.x, p.y),
+                        )
+                    },
+                );
+                let _ = reply.send(position);
+            }
+            RuntimeEvent::QueryScaleFactor { id, reply } => {
+                let raw = raw_window_id(id);
+                let factor = self
+                    .windows
+                    .get(&raw)
+                    .map_or(1.0, winit::window::Window::scale_factor);
+                let _ = reply.send(factor);
+            }
+            RuntimeEvent::QueryTitle { id, reply } => {
+                let raw = raw_window_id(id);
+                let title = self
+                    .windows
+                    .get(&raw)
+                    .map_or_else(String::new, winit::window::Window::title);
+                let _ = reply.send(title);
+            }
+            RuntimeEvent::QueryIsVisible { id, reply } => {
+                let raw = raw_window_id(id);
+                let visible = self
+                    .windows
+                    .get(&raw)
+                    .and_then(winit::window::Window::is_visible)
+                    .unwrap_or(false);
+                let _ = reply.send(visible);
+            }
+            RuntimeEvent::QueryIsFocused { id, reply } => {
+                let raw = raw_window_id(id);
+                let focused = self
+                    .windows
+                    .get(&raw)
+                    .is_some_and(winit::window::Window::has_focus);
+                let _ = reply.send(focused);
+            }
+            RuntimeEvent::QueryIsMaximized { id, reply } => {
+                let raw = raw_window_id(id);
+                let maximized = self
+                    .windows
+                    .get(&raw)
+                    .is_some_and(winit::window::Window::is_maximized);
+                let _ = reply.send(maximized);
+            }
+            RuntimeEvent::QueryIsMinimized { id, reply } => {
+                let raw = raw_window_id(id);
+                let minimized = self
+                    .windows
+                    .get(&raw)
+                    .and_then(winit::window::Window::is_minimized)
+                    .unwrap_or(false);
+                let _ = reply.send(minimized);
+            }
+            RuntimeEvent::QueryIsFullscreen { id, reply } => {
+                let raw = raw_window_id(id);
+                let fullscreen = self
+                    .windows
+                    .get(&raw)
+                    .is_some_and(|w| w.fullscreen().is_some());
+                let _ = reply.send(fullscreen);
+            }
+            RuntimeEvent::QueryIsDecorated { id, reply } => {
+                let raw = raw_window_id(id);
+                let decorated = self
+                    .windows
+                    .get(&raw)
+                    .is_some_and(winit::window::Window::is_decorated);
+                let _ = reply.send(decorated);
+            }
+            RuntimeEvent::QueryIsResizable { id, reply } => {
+                let raw = raw_window_id(id);
+                let resizable = self
+                    .windows
+                    .get(&raw)
+                    .is_some_and(winit::window::Window::is_resizable);
+                let _ = reply.send(resizable);
+            }
+            RuntimeEvent::QueryTheme { id, reply } => {
+                let raw = raw_window_id(id);
+                let theme = self
+                    .windows
+                    .get(&raw)
+                    .and_then(winit::window::Window::theme)
+                    .map_or(Theme::Light, |t| match t {
+                        winit::window::Theme::Light => Theme::Light,
+                        winit::window::Theme::Dark => Theme::Dark,
+                    });
+                let _ = reply.send(theme);
             }
             RuntimeEvent::Exit { code: _ } => {
                 event_loop.exit();
