@@ -1,4 +1,4 @@
-//! v1.3 implementation of the `tauri_runtime::Runtime` trait surface.
+//! v1.4 implementation of the `tauri_runtime::Runtime` trait surface.
 //!
 //! Backed by a real winit event loop with per-window softbuffer
 //! presentation:
@@ -71,7 +71,7 @@ use std::time::Duration;
 use cookie::Cookie;
 use raw_window_handle::{DisplayHandle, HandleError, WindowHandle};
 use softbuffer::{Context, Surface};
-use tauri_runtime::dpi::{PhysicalPosition, PhysicalSize, Position, Rect, Size};
+use tauri_runtime::dpi::{PhysicalPosition, PhysicalRect, PhysicalSize, Position, Rect, Size};
 use tauri_runtime::monitor::Monitor;
 use tauri_runtime::webview::{DetachedWebview, PendingWebview};
 use tauri_runtime::window::{
@@ -262,6 +262,30 @@ pub enum RuntimeEvent<T: UserEvent> {
         id: WindowId,
         reply: mpsc::Sender<Theme>,
     },
+    /// Asks the handler for the primary monitor of the system.
+    QueryPrimaryMonitor {
+        reply: mpsc::Sender<Option<Monitor>>,
+    },
+    /// Asks the handler for all monitors known to the system.
+    QueryAvailableMonitors { reply: mpsc::Sender<Vec<Monitor>> },
+    /// Asks the handler for the monitor that contains the given
+    /// point, in absolute coordinates.
+    QueryMonitorFromPoint {
+        x: f64,
+        y: f64,
+        reply: mpsc::Sender<Option<Monitor>>,
+    },
+    /// Asks the handler for the monitor a particular window currently
+    /// resides on.
+    QueryCurrentMonitor {
+        id: WindowId,
+        reply: mpsc::Sender<Option<Monitor>>,
+    },
+    /// Run an arbitrary closure on the main thread (where the event
+    /// loop is dispatched).
+    RunOnMainThread {
+        thunk: Box<dyn FnOnce() + Send + 'static>,
+    },
     /// Asks the runtime to exit with the given code.
     Exit { code: i32 },
 }
@@ -305,6 +329,11 @@ impl<T: UserEvent> std::fmt::Debug for RuntimeEvent<T> {
             Self::QueryIsDecorated { .. } => "QueryIsDecorated",
             Self::QueryIsResizable { .. } => "QueryIsResizable",
             Self::QueryTheme { .. } => "QueryTheme",
+            Self::QueryPrimaryMonitor { .. } => "QueryPrimaryMonitor",
+            Self::QueryAvailableMonitors { .. } => "QueryAvailableMonitors",
+            Self::QueryMonitorFromPoint { .. } => "QueryMonitorFromPoint",
+            Self::QueryCurrentMonitor { .. } => "QueryCurrentMonitor",
+            Self::RunOnMainThread { .. } => "RunOnMainThread",
             Self::Exit { .. } => "Exit",
         };
         formatter.write_str(name)
@@ -753,6 +782,12 @@ impl<T: UserEvent> Runtime<T> for ServocatRuntime<T> {
     }
 
     fn primary_monitor(&self) -> Option<Monitor> {
+        // Pre-run monitor enumeration isn't exposed by winit 0.30's
+        // `EventLoop` (monitor methods moved to `ActiveEventLoop`,
+        // only available from inside the handler).  Callers should
+        // use `RuntimeHandle::primary_monitor` after `Runtime::run`
+        // starts; this method returns `None` to keep the Tauri trait
+        // contract intact.
         None
     }
 
@@ -852,8 +887,10 @@ impl<T: UserEvent> RuntimeHandle<T> for ServocatHandle<T> {
         queue_webview(&self.proxy, window_id, pending)
     }
 
-    fn run_on_main_thread<F: FnOnce() + Send + 'static>(&self, _f: F) -> Result<()> {
-        Err(Error::EventLoopClosed)
+    fn run_on_main_thread<F: FnOnce() + Send + 'static>(&self, f: F) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::RunOnMainThread { thunk: Box::new(f) })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn display_handle(&self) -> std::result::Result<DisplayHandle<'_>, HandleError> {
@@ -861,15 +898,28 @@ impl<T: UserEvent> RuntimeHandle<T> for ServocatHandle<T> {
     }
 
     fn primary_monitor(&self) -> Option<Monitor> {
-        None
+        query(&self.proxy, |reply| RuntimeEvent::QueryPrimaryMonitor {
+            reply,
+        })
+        .ok()
+        .flatten()
     }
 
-    fn monitor_from_point(&self, _x: f64, _y: f64) -> Option<Monitor> {
-        None
+    fn monitor_from_point(&self, x: f64, y: f64) -> Option<Monitor> {
+        query(&self.proxy, |reply| RuntimeEvent::QueryMonitorFromPoint {
+            x,
+            y,
+            reply,
+        })
+        .ok()
+        .flatten()
     }
 
     fn available_monitors(&self) -> Vec<Monitor> {
-        Vec::new()
+        query(&self.proxy, |reply| RuntimeEvent::QueryAvailableMonitors {
+            reply,
+        })
+        .unwrap_or_default()
     }
 
     fn cursor_position(&self) -> Result<PhysicalPosition<f64>> {
@@ -912,8 +962,10 @@ impl<T: UserEvent> WindowDispatch<T> for ServocatWindowDispatch<T> {
     type Runtime = ServocatRuntime<T>;
     type WindowBuilder = ServocatWindowBuilder;
 
-    fn run_on_main_thread<F: FnOnce() + Send + 'static>(&self, _f: F) -> Result<()> {
-        Err(Error::EventLoopClosed)
+    fn run_on_main_thread<F: FnOnce() + Send + 'static>(&self, f: F) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::RunOnMainThread { thunk: Box::new(f) })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn on_window_event<F: Fn(&TauriWindowEvent) + Send + 'static>(&self, _f: F) -> WindowEventId {
@@ -1032,19 +1084,30 @@ impl<T: UserEvent> WindowDispatch<T> for ServocatWindowDispatch<T> {
     }
 
     fn current_monitor(&self) -> Result<Option<Monitor>> {
-        Ok(None)
+        query(&self.proxy, |reply| RuntimeEvent::QueryCurrentMonitor {
+            id: self.window_id,
+            reply,
+        })
     }
 
     fn primary_monitor(&self) -> Result<Option<Monitor>> {
-        Ok(None)
+        query(&self.proxy, |reply| RuntimeEvent::QueryPrimaryMonitor {
+            reply,
+        })
     }
 
-    fn monitor_from_point(&self, _x: f64, _y: f64) -> Result<Option<Monitor>> {
-        Ok(None)
+    fn monitor_from_point(&self, x: f64, y: f64) -> Result<Option<Monitor>> {
+        query(&self.proxy, |reply| RuntimeEvent::QueryMonitorFromPoint {
+            x,
+            y,
+            reply,
+        })
     }
 
     fn available_monitors(&self) -> Result<Vec<Monitor>> {
-        Ok(Vec::new())
+        query(&self.proxy, |reply| RuntimeEvent::QueryAvailableMonitors {
+            reply,
+        })
     }
 
     fn window_handle(&self) -> std::result::Result<WindowHandle<'_>, HandleError> {
@@ -1325,8 +1388,10 @@ impl<T: UserEvent> WindowDispatch<T> for ServocatWindowDispatch<T> {
 impl<T: UserEvent> WebviewDispatch<T> for ServocatWebviewDispatch<T> {
     type Runtime = ServocatRuntime<T>;
 
-    fn run_on_main_thread<F: FnOnce() + Send + 'static>(&self, _f: F) -> Result<()> {
-        Err(Error::EventLoopClosed)
+    fn run_on_main_thread<F: FnOnce() + Send + 'static>(&self, f: F) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::RunOnMainThread { thunk: Box::new(f) })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn on_webview_event<F: Fn(&WebviewEvent) + Send + 'static>(&self, _f: F) -> WebviewEventId {
@@ -1590,26 +1655,65 @@ impl WebviewState {
     }
 }
 
-/// Extract a usable HTML body from a URL.  Currently handles
-/// `data:text/html,<body>` (with optional `;charset=utf-8` /
-/// `;base64` params dropped); everything else falls back to a
-/// placeholder body containing the URL.  Percent-decoding is
-/// intentionally not done in v1.2 -- pass literal HTML in the data
-/// URL body.
+/// Extract a usable HTML body from a URL.  v1.4 handles
+/// `data:text/html,<percent-encoded body>`, `file:///...`, and
+/// `http://...` (via net-cat; runs synchronously on the event-loop
+/// thread, so prefer it from `eval_script` only when latency is OK).
+/// Falls back to a placeholder body for unsupported schemes.
 fn html_from_url(url: &str) -> String {
-    let parsed = url::Url::parse(url).ok();
-    let from_data = parsed
-        .as_ref()
-        .filter(|u| u.scheme() == "data")
-        .and_then(|u| u.path().split_once(','))
-        .map(|(_mime, body)| body.to_owned());
-    from_data.unwrap_or_else(|| {
-        format!(
-            "<html><body><h1>tauri-runtime-servocat</h1>\
-             <p>Unsupported URL scheme.  v1.2 handles \
-             <code>data:text/html,...</code>; got: {url}</p></body></html>"
-        )
-    })
+    try_data_url(url)
+        .or_else(|| try_file_url(url))
+        .or_else(|| try_http_url(url))
+        .unwrap_or_else(|| {
+            format!(
+                "<html><body><h1>tauri-runtime-servocat</h1>\
+                 <p>Unsupported URL scheme: <code>{url}</code></p>\
+                 </body></html>"
+            )
+        })
+}
+
+fn try_data_url(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    (parsed.scheme() == "data").then_some(())?;
+    let (_mime, body) = parsed.path().split_once(',')?;
+    let decoded = percent_encoding::percent_decode_str(body)
+        .decode_utf8()
+        .ok()?;
+    Some(decoded.into_owned())
+}
+
+fn try_file_url(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    (parsed.scheme() == "file").then_some(())?;
+    let path = parsed.to_file_path().ok()?;
+    std::fs::read_to_string(path).ok()
+}
+
+fn try_http_url(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    (parsed.scheme() == "http").then_some(())?;
+    let net_url = net_cat::url::Url::parse(url).ok()?;
+    let request = net_cat::request::Request::new(net_cat::method::Method::Get, net_url);
+    let response = net_cat::fetch(&request).ok()?;
+    Some(response.body_text())
+}
+
+fn winit_monitor_to_tauri(handle: &winit::monitor::MonitorHandle) -> Monitor {
+    let size = handle.size();
+    let position = handle.position();
+    let physical_size = PhysicalSize::new(size.width, size.height);
+    let physical_position = PhysicalPosition::new(position.x, position.y);
+    Monitor {
+        name: handle.name(),
+        size: physical_size,
+        position: physical_position,
+        work_area: PhysicalRect {
+            position: physical_position,
+            size: physical_size,
+        },
+        scale_factor: handle.scale_factor(),
+    }
 }
 
 fn skeleton_error_from(msg: String) -> Box<dyn std::error::Error + Send + Sync> {
@@ -2008,6 +2112,50 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                     .get(&raw)
                     .is_some_and(winit::window::Window::is_resizable);
                 let _ = reply.send(resizable);
+            }
+            RuntimeEvent::QueryPrimaryMonitor { reply } => {
+                let monitor = event_loop
+                    .primary_monitor()
+                    .as_ref()
+                    .map(winit_monitor_to_tauri);
+                let _ = reply.send(monitor);
+            }
+            RuntimeEvent::QueryAvailableMonitors { reply } => {
+                let monitors: Vec<Monitor> = event_loop
+                    .available_monitors()
+                    .map(|handle| winit_monitor_to_tauri(&handle))
+                    .collect();
+                let _ = reply.send(monitors);
+            }
+            RuntimeEvent::QueryMonitorFromPoint { x, y, reply } => {
+                let position = winit::dpi::PhysicalPosition::new(x, y);
+                let monitor = event_loop
+                    .available_monitors()
+                    .find(|handle| {
+                        let pos = handle.position();
+                        let size = handle.size();
+                        let in_x = position.x >= f64::from(pos.x)
+                            && position.x < f64::from(pos.x) + f64::from(size.width);
+                        let in_y = position.y >= f64::from(pos.y)
+                            && position.y < f64::from(pos.y) + f64::from(size.height);
+                        in_x && in_y
+                    })
+                    .as_ref()
+                    .map(winit_monitor_to_tauri);
+                let _ = reply.send(monitor);
+            }
+            RuntimeEvent::QueryCurrentMonitor { id, reply } => {
+                let raw = raw_window_id(id);
+                let monitor = self
+                    .windows
+                    .get(&raw)
+                    .and_then(winit::window::Window::current_monitor)
+                    .as_ref()
+                    .map(winit_monitor_to_tauri);
+                let _ = reply.send(monitor);
+            }
+            RuntimeEvent::RunOnMainThread { thunk } => {
+                thunk();
             }
             RuntimeEvent::QueryTheme { id, reply } => {
                 let raw = raw_window_id(id);
