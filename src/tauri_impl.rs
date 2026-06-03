@@ -1,4 +1,4 @@
-//! v1.4 implementation of the `tauri_runtime::Runtime` trait surface.
+//! v1.5 implementation of the `tauri_runtime::Runtime` trait surface.
 //!
 //! Backed by a real winit event loop with per-window softbuffer
 //! presentation:
@@ -73,7 +73,7 @@ use raw_window_handle::{DisplayHandle, HandleError, WindowHandle};
 use softbuffer::{Context, Surface};
 use tauri_runtime::dpi::{PhysicalPosition, PhysicalRect, PhysicalSize, Position, Rect, Size};
 use tauri_runtime::monitor::Monitor;
-use tauri_runtime::webview::{DetachedWebview, PendingWebview};
+use tauri_runtime::webview::{DetachedWebview, PendingWebview, WebviewIpcHandler};
 use tauri_runtime::window::{
     CursorIcon, DetachedWindow, PendingWindow, RawWindow, WebviewEvent, WindowBuilder,
     WindowBuilderBase, WindowEvent as TauriWindowEvent, WindowId, WindowSizeConstraints,
@@ -167,11 +167,21 @@ pub enum RuntimeEvent<T: UserEvent> {
     /// Attaches a webview to an existing window with the given URL.
     /// The runtime will parse the URL (currently `data:text/html,...`),
     /// build the cat-stack pipeline, and present the resulting frame
-    /// into the window via softbuffer.
+    /// into the window via softbuffer.  The optional `ipc_handler` is
+    /// stored alongside the webview so [`ServocatWebviewDispatch::send_ipc`]
+    /// (and, in a later release, a `__TAURI_INTERNALS__.postMessage`
+    /// JS bridge) can fire the host's `invoke_handler`.
     CreateWebview {
         window_id: WindowId,
         label: String,
         url: String,
+        ipc_handler: Option<WebviewIpcHandler<T, ServocatRuntime<T>>>,
+    },
+    /// Synthesizes a webview->host IPC request, invoking the
+    /// `ipc_handler` registered when the webview was created.
+    IpcRequest {
+        window_id: WindowId,
+        request: http::Request<String>,
     },
     /// Navigates the webview attached to a window to a new URL.  The
     /// runtime re-builds the pipeline against the new content and
@@ -311,6 +321,7 @@ impl<T: UserEvent> std::fmt::Debug for RuntimeEvent<T> {
             Self::SetDecorations { .. } => "SetDecorations",
             Self::SetFullscreen { .. } => "SetFullscreen",
             Self::CreateWebview { .. } => "CreateWebview",
+            Self::IpcRequest { .. } => "IpcRequest",
             Self::Navigate { .. } => "Navigate",
             Self::Reload { .. } => "Reload",
             Self::EvalScript { .. } => "EvalScript",
@@ -429,6 +440,31 @@ impl<T: UserEvent> Clone for ServocatWebviewDispatch<T> {
             window_id: self.window_id,
             _marker: PhantomData,
         }
+    }
+}
+
+impl<T: UserEvent> ServocatWebviewDispatch<T> {
+    /// v1.5 Rust-side IPC bridge: fires the `ipc_handler` that was
+    /// supplied to [`PendingWebview::ipc_handler`] when this webview
+    /// was created.  The host's handler runs on the event-loop
+    /// thread; results can be delivered back to JS via the standard
+    /// `WebviewDispatch::eval_script` machinery (which Tauri's
+    /// command system already does internally).
+    ///
+    /// Wiring this to a JS-side `__TAURI_INTERNALS__.postMessage`
+    /// shim is left for a future 1.5.x release.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::EventLoopClosed`] if the event loop has
+    /// already exited.
+    pub fn send_ipc(&self, request: http::Request<String>) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::IpcRequest {
+                window_id: self.window_id,
+                request,
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 }
 
@@ -836,8 +872,9 @@ impl<T: UserEvent> Runtime<T> for ServocatRuntime<T> {
     }
 
     fn run<F: FnMut(RunEvent<T>) + 'static>(mut self, callback: F) {
+        let proxy = self.proxy.clone();
         let _ = self.event_loop.take().map(|event_loop| {
-            let mut app = AppHandler::new(callback);
+            let mut app = AppHandler::new(callback, proxy);
             let _ = event_loop.run_app(&mut app);
         });
     }
@@ -1602,6 +1639,7 @@ fn queue_webview<T: UserEvent>(
             window_id,
             label: label.clone(),
             url: pending.url,
+            ipc_handler: pending.ipc_handler,
         })
         .map_err(|err| Error::CreateWebview(skeleton_error_from(err.to_string())))?;
     Ok(DetachedWebview {
@@ -1616,23 +1654,34 @@ fn queue_webview<T: UserEvent>(
 
 /// Per-window webview state held by [`AppHandler`].  v1.2 keeps the
 /// caller-supplied HTML/CSS so `reload` + `eval_script` can rebuild
-/// the pipeline without re-fetching.
-struct WebviewState {
+/// the pipeline without re-fetching; v1.5 adds the label + optional
+/// `ipc_handler` so [`ServocatWebviewDispatch::send_ipc`] can route
+/// requests to the host's `invoke_handler`.
+struct WebviewState<T: UserEvent> {
+    label: String,
     html: String,
     css: String,
     viewport: Viewport,
     current_frame: Option<Frame>,
     text_renderer: TextRenderer,
+    ipc_handler: Option<WebviewIpcHandler<T, ServocatRuntime<T>>>,
 }
 
-impl WebviewState {
-    fn new(html: String, viewport: Viewport) -> Self {
+impl<T: UserEvent> WebviewState<T> {
+    fn new(
+        label: String,
+        html: String,
+        viewport: Viewport,
+        ipc_handler: Option<WebviewIpcHandler<T, ServocatRuntime<T>>>,
+    ) -> Self {
         Self {
+            label,
             html,
             css: String::new(),
             viewport,
             current_frame: None,
             text_renderer: TextRenderer::new(),
+            ipc_handler,
         }
     }
 
@@ -1722,24 +1771,24 @@ fn skeleton_error_from(msg: String) -> Box<dyn std::error::Error + Send + Sync> 
 
 struct AppHandler<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> {
     callback: F,
+    proxy: EventLoopProxy<RuntimeEvent<T>>,
     windows: BTreeMap<u32, Window>,
     labels: BTreeMap<u32, String>,
     winit_to_tauri: BTreeMap<WinitWindowId, u32>,
-    webviews: BTreeMap<u32, WebviewState>,
+    webviews: BTreeMap<u32, WebviewState<T>>,
     ready_dispatched: bool,
-    _marker: PhantomData<fn() -> T>,
 }
 
 impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> AppHandler<T, F> {
-    fn new(callback: F) -> Self {
+    fn new(callback: F, proxy: EventLoopProxy<RuntimeEvent<T>>) -> Self {
         Self {
             callback,
+            proxy,
             windows: BTreeMap::new(),
             labels: BTreeMap::new(),
             winit_to_tauri: BTreeMap::new(),
             webviews: BTreeMap::new(),
             ready_dispatched: false,
-            _marker: PhantomData,
         }
     }
 
@@ -1761,7 +1810,7 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> AppHandler<T, F> {
     }
 }
 
-fn present_webview(window: &Window, webview: &mut WebviewState) -> Option<()> {
+fn present_webview<T: UserEvent>(window: &Window, webview: &mut WebviewState<T>) -> Option<()> {
     let size = window.inner_size();
     let width = NonZeroU32::new(size.width)?;
     let height = NonZeroU32::new(size.height)?;
@@ -1938,8 +1987,9 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
             }
             RuntimeEvent::CreateWebview {
                 window_id,
-                label: _label,
+                label,
                 url,
+                ipc_handler,
             } => {
                 let raw = raw_window_id(window_id);
                 let viewport = self.windows.get(&raw).map_or_else(
@@ -1950,10 +2000,30 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                     },
                 );
                 let html = html_from_url(&url);
-                let mut state = WebviewState::new(html, viewport);
+                let mut state = WebviewState::new(label, html, viewport, ipc_handler);
                 state.rebuild_frame();
                 let _ = self.webviews.insert(raw, state);
                 self.request_redraw(raw);
+            }
+            RuntimeEvent::IpcRequest { window_id, request } => {
+                let raw = raw_window_id(window_id);
+                let dispatch_pair = self.webviews.get(&raw).and_then(|webview| {
+                    webview
+                        .ipc_handler
+                        .as_ref()
+                        .map(|handler| (handler, webview.label.clone()))
+                });
+                let _ = dispatch_pair.map(|(handler, label)| {
+                    let detached = DetachedWebview {
+                        label,
+                        dispatcher: ServocatWebviewDispatch {
+                            proxy: self.proxy.clone(),
+                            window_id,
+                            _marker: PhantomData,
+                        },
+                    };
+                    handler(detached, request);
+                });
             }
             RuntimeEvent::Navigate { window_id, url } => {
                 let raw = raw_window_id(window_id);
