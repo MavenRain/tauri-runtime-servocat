@@ -1,4 +1,4 @@
-//! v1.6 implementation of the `tauri_runtime::Runtime` trait surface.
+//! v1.7 implementation of the `tauri_runtime::Runtime` trait surface.
 //!
 //! Backed by a real winit event loop with per-window softbuffer
 //! presentation:
@@ -336,6 +336,64 @@ pub enum RuntimeEvent<T: UserEvent> {
         width: u32,
         height: u32,
     },
+    /// Updates the tracked `enabled` flag for a window.
+    SetEnabled { id: WindowId, enabled: bool },
+    /// Updates the tracked `maximizable` flag for a window.
+    SetMaximizable { id: WindowId, maximizable: bool },
+    /// Updates the tracked `minimizable` flag for a window.
+    SetMinimizable { id: WindowId, minimizable: bool },
+    /// Updates the tracked `closable` flag for a window.
+    SetClosable { id: WindowId, closable: bool },
+    /// Updates the tracked `focusable` flag for a window.
+    SetFocusable { id: WindowId, focusable: bool },
+    /// Updates the tracked `skip_taskbar` flag for a window.
+    SetSkipTaskbar { id: WindowId, skip: bool },
+    /// Asks the handler whether a window's `enabled` flag is set.
+    QueryIsEnabled {
+        id: WindowId,
+        reply: mpsc::Sender<bool>,
+    },
+    /// Asks the handler whether a window's `maximizable` flag is set.
+    QueryIsMaximizable {
+        id: WindowId,
+        reply: mpsc::Sender<bool>,
+    },
+    /// Asks the handler whether a window's `minimizable` flag is set.
+    QueryIsMinimizable {
+        id: WindowId,
+        reply: mpsc::Sender<bool>,
+    },
+    /// Asks the handler whether a window's `closable` flag is set.
+    QueryIsClosable {
+        id: WindowId,
+        reply: mpsc::Sender<bool>,
+    },
+    /// Asks the handler whether a window's `always_on_top` flag is set.
+    QueryIsAlwaysOnTop {
+        id: WindowId,
+        reply: mpsc::Sender<bool>,
+    },
+    /// Updates the tracked bounds (position + size) of a webview.
+    SetWebviewBounds { id: WindowId, bounds: Rect },
+    /// Updates the tracked size of a webview (position unchanged).
+    SetWebviewSize { id: WindowId, size: Size },
+    /// Updates the tracked position of a webview (size unchanged).
+    SetWebviewPosition { id: WindowId, position: Position },
+    /// Asks the handler for the tracked bounds of a webview.
+    QueryWebviewBounds {
+        id: WindowId,
+        reply: mpsc::Sender<Rect>,
+    },
+    /// Asks the handler for the tracked position of a webview.
+    QueryWebviewPosition {
+        id: WindowId,
+        reply: mpsc::Sender<PhysicalPosition<i32>>,
+    },
+    /// Asks the handler for the tracked size of a webview.
+    QueryWebviewSize {
+        id: WindowId,
+        reply: mpsc::Sender<PhysicalSize<u32>>,
+    },
     /// Asks the runtime to exit with the given code.
     Exit { code: i32 },
 }
@@ -398,6 +456,23 @@ impl<T: UserEvent> std::fmt::Debug for RuntimeEvent<T> {
             Self::RequestUserAttention { .. } => "RequestUserAttention",
             Self::CenterWindow { .. } => "CenterWindow",
             Self::SetWindowIcon { .. } => "SetWindowIcon",
+            Self::SetEnabled { .. } => "SetEnabled",
+            Self::SetMaximizable { .. } => "SetMaximizable",
+            Self::SetMinimizable { .. } => "SetMinimizable",
+            Self::SetClosable { .. } => "SetClosable",
+            Self::SetFocusable { .. } => "SetFocusable",
+            Self::SetSkipTaskbar { .. } => "SetSkipTaskbar",
+            Self::QueryIsEnabled { .. } => "QueryIsEnabled",
+            Self::QueryIsMaximizable { .. } => "QueryIsMaximizable",
+            Self::QueryIsMinimizable { .. } => "QueryIsMinimizable",
+            Self::QueryIsClosable { .. } => "QueryIsClosable",
+            Self::QueryIsAlwaysOnTop { .. } => "QueryIsAlwaysOnTop",
+            Self::SetWebviewBounds { .. } => "SetWebviewBounds",
+            Self::SetWebviewSize { .. } => "SetWebviewSize",
+            Self::SetWebviewPosition { .. } => "SetWebviewPosition",
+            Self::QueryWebviewBounds { .. } => "QueryWebviewBounds",
+            Self::QueryWebviewPosition { .. } => "QueryWebviewPosition",
+            Self::QueryWebviewSize { .. } => "QueryWebviewSize",
             Self::Exit { .. } => "Exit",
         };
         formatter.write_str(name)
@@ -1140,15 +1215,24 @@ impl<T: UserEvent> WindowDispatch<T> for ServocatWindowDispatch<T> {
     }
 
     fn is_maximizable(&self) -> Result<bool> {
-        Ok(false)
+        query(&self.proxy, |reply| RuntimeEvent::QueryIsMaximizable {
+            id: self.window_id,
+            reply,
+        })
     }
 
     fn is_minimizable(&self) -> Result<bool> {
-        Ok(false)
+        query(&self.proxy, |reply| RuntimeEvent::QueryIsMinimizable {
+            id: self.window_id,
+            reply,
+        })
     }
 
     fn is_closable(&self) -> Result<bool> {
-        Ok(false)
+        query(&self.proxy, |reply| RuntimeEvent::QueryIsClosable {
+            id: self.window_id,
+            reply,
+        })
     }
 
     fn is_visible(&self) -> Result<bool> {
@@ -1159,11 +1243,17 @@ impl<T: UserEvent> WindowDispatch<T> for ServocatWindowDispatch<T> {
     }
 
     fn is_enabled(&self) -> Result<bool> {
-        Ok(false)
+        query(&self.proxy, |reply| RuntimeEvent::QueryIsEnabled {
+            id: self.window_id,
+            reply,
+        })
     }
 
     fn is_always_on_top(&self) -> Result<bool> {
-        Ok(false)
+        query(&self.proxy, |reply| RuntimeEvent::QueryIsAlwaysOnTop {
+            id: self.window_id,
+            reply,
+        })
     }
 
     fn title(&self) -> Result<String> {
@@ -1253,20 +1343,40 @@ impl<T: UserEvent> WindowDispatch<T> for ServocatWindowDispatch<T> {
             .map_err(|_e| Error::EventLoopClosed)
     }
 
-    fn set_enabled(&self, _enabled: bool) -> Result<()> {
-        Ok(())
+    fn set_enabled(&self, enabled: bool) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::SetEnabled {
+                id: self.window_id,
+                enabled,
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
-    fn set_maximizable(&self, _maximizable: bool) -> Result<()> {
-        Ok(())
+    fn set_maximizable(&self, maximizable: bool) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::SetMaximizable {
+                id: self.window_id,
+                maximizable,
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
-    fn set_minimizable(&self, _minimizable: bool) -> Result<()> {
-        Ok(())
+    fn set_minimizable(&self, minimizable: bool) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::SetMinimizable {
+                id: self.window_id,
+                minimizable,
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
-    fn set_closable(&self, _closable: bool) -> Result<()> {
-        Ok(())
+    fn set_closable(&self, closable: bool) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::SetClosable {
+                id: self.window_id,
+                closable,
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn set_title<S: Into<String>>(&self, title: S) -> Result<()> {
@@ -1424,8 +1534,13 @@ impl<T: UserEvent> WindowDispatch<T> for ServocatWindowDispatch<T> {
             .map_err(|_e| Error::EventLoopClosed)
     }
 
-    fn set_focusable(&self, _focusable: bool) -> Result<()> {
-        Ok(())
+    fn set_focusable(&self, focusable: bool) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::SetFocusable {
+                id: self.window_id,
+                focusable,
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn set_icon(&self, icon: Icon<'_>) -> Result<()> {
@@ -1439,8 +1554,13 @@ impl<T: UserEvent> WindowDispatch<T> for ServocatWindowDispatch<T> {
             .map_err(|_e| Error::EventLoopClosed)
     }
 
-    fn set_skip_taskbar(&self, _skip: bool) -> Result<()> {
-        Ok(())
+    fn set_skip_taskbar(&self, skip: bool) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::SetSkipTaskbar {
+                id: self.window_id,
+                skip,
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn set_cursor_grab(&self, grab: bool) -> Result<()> {
@@ -1572,18 +1692,24 @@ impl<T: UserEvent> WebviewDispatch<T> for ServocatWebviewDispatch<T> {
     }
 
     fn bounds(&self) -> Result<Rect> {
-        Ok(Rect {
-            position: tauri_runtime::dpi::Position::Physical(PhysicalPosition::new(0, 0)),
-            size: tauri_runtime::dpi::Size::Physical(PhysicalSize::new(0, 0)),
+        query(&self.proxy, |reply| RuntimeEvent::QueryWebviewBounds {
+            id: self.window_id,
+            reply,
         })
     }
 
     fn position(&self) -> Result<PhysicalPosition<i32>> {
-        Ok(PhysicalPosition::new(0, 0))
+        query(&self.proxy, |reply| RuntimeEvent::QueryWebviewPosition {
+            id: self.window_id,
+            reply,
+        })
     }
 
     fn size(&self) -> Result<PhysicalSize<u32>> {
-        Ok(PhysicalSize::new(0, 0))
+        query(&self.proxy, |reply| RuntimeEvent::QueryWebviewSize {
+            id: self.window_id,
+            reply,
+        })
     }
 
     fn navigate(&self, url: Url) -> Result<()> {
@@ -1613,16 +1739,31 @@ impl<T: UserEvent> WebviewDispatch<T> for ServocatWebviewDispatch<T> {
             .map_err(|_e| Error::EventLoopClosed)
     }
 
-    fn set_bounds(&self, _bounds: Rect) -> Result<()> {
-        Ok(())
+    fn set_bounds(&self, bounds: Rect) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::SetWebviewBounds {
+                id: self.window_id,
+                bounds,
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
-    fn set_size(&self, _size: Size) -> Result<()> {
-        Ok(())
+    fn set_size(&self, size: Size) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::SetWebviewSize {
+                id: self.window_id,
+                size,
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
-    fn set_position(&self, _position: Position) -> Result<()> {
-        Ok(())
+    fn set_position(&self, position: Position) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::SetWebviewPosition {
+                id: self.window_id,
+                position,
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn set_focus(&self) -> Result<()> {
@@ -1834,11 +1975,45 @@ fn post_ipc_message_impl(args: Vec<Value>, _this: Value, heap: BoaHeap, fuel: Fu
     Ok((Outcome::Normal(Value::Undefined), heap, fuel))
 }
 
+/// Per-window flag bookkeeping for methods that have no direct winit
+/// equivalent (`is_enabled` / `is_maximizable` / `is_minimizable` /
+/// `is_closable` / `is_focusable`) plus the always-on-top mirror.
+/// Default values follow winit's defaults: enabled, max/min/closable,
+/// and focusable on; always-on-top off.  Boolean count is the trait
+/// surface's natural shape; the lint isn't useful here.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy)]
+struct WindowFlags {
+    enabled: bool,
+    maximizable: bool,
+    minimizable: bool,
+    closable: bool,
+    always_on_top: bool,
+    focusable: bool,
+    skip_taskbar: bool,
+}
+
+impl Default for WindowFlags {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            maximizable: true,
+            minimizable: true,
+            closable: true,
+            always_on_top: false,
+            focusable: true,
+            skip_taskbar: false,
+        }
+    }
+}
+
 /// Per-window webview state held by [`AppHandler`].  v1.2 keeps the
 /// caller-supplied HTML/CSS so `reload` + `eval_script` can rebuild
 /// the pipeline without re-fetching; v1.5 adds the label + optional
 /// `ipc_handler` so [`ServocatWebviewDispatch::send_ipc`] can route
-/// requests to the host's `invoke_handler`.
+/// requests to the host's `invoke_handler`; v1.7 adds a tracked
+/// bounds rect that `set_bounds` / `set_size` / `set_position` update
+/// and `bounds()` / `position()` / `size()` read.
 struct WebviewState<T: UserEvent> {
     label: String,
     html: String,
@@ -1847,6 +2022,7 @@ struct WebviewState<T: UserEvent> {
     current_frame: Option<Frame>,
     text_renderer: TextRenderer,
     ipc_handler: Option<WebviewIpcHandler<T, ServocatRuntime<T>>>,
+    bounds: Rect,
 }
 
 impl<T: UserEvent> WebviewState<T> {
@@ -1864,6 +2040,13 @@ impl<T: UserEvent> WebviewState<T> {
             current_frame: None,
             text_renderer: TextRenderer::new(),
             ipc_handler,
+            bounds: Rect {
+                position: Position::Physical(PhysicalPosition::new(0, 0)),
+                size: tauri_runtime::dpi::Size::Physical(PhysicalSize::new(
+                    viewport.width(),
+                    viewport.height(),
+                )),
+            },
         }
     }
 
@@ -2027,6 +2210,7 @@ struct AppHandler<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> {
     labels: BTreeMap<u32, String>,
     winit_to_tauri: BTreeMap<WinitWindowId, u32>,
     webviews: BTreeMap<u32, WebviewState<T>>,
+    flags: BTreeMap<u32, WindowFlags>,
     ready_dispatched: bool,
 }
 
@@ -2039,6 +2223,7 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> AppHandler<T, F> {
             labels: BTreeMap::new(),
             winit_to_tauri: BTreeMap::new(),
             webviews: BTreeMap::new(),
+            flags: BTreeMap::new(),
             ready_dispatched: false,
         }
     }
@@ -2127,6 +2312,7 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                     let _ = self.winit_to_tauri.insert(winit_id, raw);
                     let _ = self.windows.insert(raw, window);
                     let _ = self.labels.insert(raw, label);
+                    let _ = self.flags.insert(raw, WindowFlags::default());
                 });
             }
             RuntimeEvent::SetTitle { id, title } => {
@@ -2186,6 +2372,7 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                 });
                 self.dispatch_window_event(raw, TauriWindowEvent::Destroyed);
                 let _ = self.labels.remove(&raw);
+                let _ = self.flags.remove(&raw);
             }
             RuntimeEvent::Maximize { id } => {
                 let raw = raw_window_id(id);
@@ -2566,6 +2753,9 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                     .windows
                     .get(&raw)
                     .map(|window| window.set_window_level(level));
+                let _ = self.flags.get_mut(&raw).map(|flags| {
+                    flags.always_on_top = always_on_top;
+                });
             }
             RuntimeEvent::SetWindowTheme { id, theme } => {
                 let raw = raw_window_id(id);
@@ -2632,6 +2822,141 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                             .get(&raw)
                             .map(|window| window.set_window_icon(Some(winit_icon)));
                     });
+            }
+            RuntimeEvent::SetEnabled { id, enabled } => {
+                let raw = raw_window_id(id);
+                let _ = self.flags.get_mut(&raw).map(|flags| {
+                    flags.enabled = enabled;
+                });
+            }
+            RuntimeEvent::SetMaximizable { id, maximizable } => {
+                let raw = raw_window_id(id);
+                let _ = self.flags.get_mut(&raw).map(|flags| {
+                    flags.maximizable = maximizable;
+                });
+            }
+            RuntimeEvent::SetMinimizable { id, minimizable } => {
+                let raw = raw_window_id(id);
+                let _ = self.flags.get_mut(&raw).map(|flags| {
+                    flags.minimizable = minimizable;
+                });
+            }
+            RuntimeEvent::SetClosable { id, closable } => {
+                let raw = raw_window_id(id);
+                let _ = self.flags.get_mut(&raw).map(|flags| {
+                    flags.closable = closable;
+                });
+            }
+            RuntimeEvent::SetFocusable { id, focusable } => {
+                let raw = raw_window_id(id);
+                let _ = self.flags.get_mut(&raw).map(|flags| {
+                    flags.focusable = focusable;
+                });
+            }
+            RuntimeEvent::SetSkipTaskbar { id, skip } => {
+                let raw = raw_window_id(id);
+                let _ = self.flags.get_mut(&raw).map(|flags| {
+                    flags.skip_taskbar = skip;
+                });
+            }
+            RuntimeEvent::QueryIsEnabled { id, reply } => {
+                let raw = raw_window_id(id);
+                let value = self.flags.get(&raw).is_some_and(|flags| flags.enabled);
+                let _ = reply.send(value);
+            }
+            RuntimeEvent::QueryIsMaximizable { id, reply } => {
+                let raw = raw_window_id(id);
+                let value = self.flags.get(&raw).is_some_and(|flags| flags.maximizable);
+                let _ = reply.send(value);
+            }
+            RuntimeEvent::QueryIsMinimizable { id, reply } => {
+                let raw = raw_window_id(id);
+                let value = self.flags.get(&raw).is_some_and(|flags| flags.minimizable);
+                let _ = reply.send(value);
+            }
+            RuntimeEvent::QueryIsClosable { id, reply } => {
+                let raw = raw_window_id(id);
+                let value = self.flags.get(&raw).is_some_and(|flags| flags.closable);
+                let _ = reply.send(value);
+            }
+            RuntimeEvent::QueryIsAlwaysOnTop { id, reply } => {
+                let raw = raw_window_id(id);
+                let value = self
+                    .flags
+                    .get(&raw)
+                    .is_some_and(|flags| flags.always_on_top);
+                let _ = reply.send(value);
+            }
+            RuntimeEvent::SetWebviewBounds { id, bounds } => {
+                let raw = raw_window_id(id);
+                let _ = self.webviews.get_mut(&raw).map(|webview| {
+                    webview.bounds = bounds;
+                });
+            }
+            RuntimeEvent::SetWebviewSize { id, size } => {
+                let raw = raw_window_id(id);
+                let _ = self.webviews.get_mut(&raw).map(|webview| {
+                    webview.bounds = Rect {
+                        position: webview.bounds.position,
+                        size,
+                    };
+                });
+            }
+            RuntimeEvent::SetWebviewPosition { id, position } => {
+                let raw = raw_window_id(id);
+                let _ = self.webviews.get_mut(&raw).map(|webview| {
+                    webview.bounds = Rect {
+                        position,
+                        size: webview.bounds.size,
+                    };
+                });
+            }
+            RuntimeEvent::QueryWebviewBounds { id, reply } => {
+                let raw = raw_window_id(id);
+                let value = self.webviews.get(&raw).map_or_else(
+                    || Rect {
+                        position: Position::Physical(PhysicalPosition::new(0, 0)),
+                        size: tauri_runtime::dpi::Size::Physical(PhysicalSize::new(0, 0)),
+                    },
+                    |webview| webview.bounds,
+                );
+                let _ = reply.send(value);
+            }
+            RuntimeEvent::QueryWebviewPosition { id, reply } => {
+                let raw = raw_window_id(id);
+                let value = self.webviews.get(&raw).map_or_else(
+                    || PhysicalPosition::new(0, 0),
+                    |webview| match webview.bounds.position {
+                        Position::Physical(p) => PhysicalPosition::new(p.x, p.y),
+                        Position::Logical(p) => {
+                            #[allow(clippy::cast_possible_truncation)]
+                            let x = p.x as i32;
+                            #[allow(clippy::cast_possible_truncation)]
+                            let y = p.y as i32;
+                            PhysicalPosition::new(x, y)
+                        }
+                    },
+                );
+                let _ = reply.send(value);
+            }
+            RuntimeEvent::QueryWebviewSize { id, reply } => {
+                let raw = raw_window_id(id);
+                let value = self.webviews.get(&raw).map_or_else(
+                    || PhysicalSize::new(0, 0),
+                    |webview| match webview.bounds.size {
+                        tauri_runtime::dpi::Size::Physical(s) => {
+                            PhysicalSize::new(s.width, s.height)
+                        }
+                        tauri_runtime::dpi::Size::Logical(s) => {
+                            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                            let w = s.width as u32;
+                            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                            let h = s.height as u32;
+                            PhysicalSize::new(w, h)
+                        }
+                    },
+                );
+                let _ = reply.send(value);
             }
             RuntimeEvent::Exit { code: _ } => {
                 event_loop.exit();
