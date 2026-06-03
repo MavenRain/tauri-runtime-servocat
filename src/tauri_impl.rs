@@ -1,4 +1,4 @@
-//! v1.5.1 implementation of the `tauri_runtime::Runtime` trait surface.
+//! v1.6 implementation of the `tauri_runtime::Runtime` trait surface.
 //!
 //! Backed by a real winit event loop with per-window softbuffer
 //! presentation:
@@ -302,6 +302,40 @@ pub enum RuntimeEvent<T: UserEvent> {
     RunOnMainThread {
         thunk: Box<dyn FnOnce() + Send + 'static>,
     },
+    /// Sets cursor visibility for an existing window.
+    SetCursorVisible { id: WindowId, visible: bool },
+    /// Sets cursor grab (lock to window) for an existing window.
+    SetCursorGrab { id: WindowId, grab: bool },
+    /// Sets the cursor icon for an existing window.
+    SetCursorIcon { id: WindowId, icon: CursorIcon },
+    /// Moves the cursor within an existing window's coordinate system.
+    SetCursorPosition { id: WindowId, position: Position },
+    /// Toggles whether an existing window passes cursor events through.
+    SetIgnoreCursorEvents { id: WindowId, ignore: bool },
+    /// Updates the minimum inner size constraint of an existing window.
+    SetMinSize { id: WindowId, size: Option<Size> },
+    /// Updates the maximum inner size constraint of an existing window.
+    SetMaxSize { id: WindowId, size: Option<Size> },
+    /// Updates the always-on-top flag of an existing window.
+    SetAlwaysOnTop { id: WindowId, always_on_top: bool },
+    /// Updates the theme of an existing window.
+    SetWindowTheme { id: WindowId, theme: Option<Theme> },
+    /// Starts dragging the OS chrome of an existing window.
+    StartDragging { id: WindowId },
+    /// Requests user attention to an existing window.
+    RequestUserAttention {
+        id: WindowId,
+        request_type: Option<tauri_runtime::UserAttentionType>,
+    },
+    /// Centers an existing window on its current monitor.
+    CenterWindow { id: WindowId },
+    /// Sets the icon of an existing window.
+    SetWindowIcon {
+        id: WindowId,
+        rgba: Vec<u8>,
+        width: u32,
+        height: u32,
+    },
     /// Asks the runtime to exit with the given code.
     Exit { code: i32 },
 }
@@ -351,6 +385,19 @@ impl<T: UserEvent> std::fmt::Debug for RuntimeEvent<T> {
             Self::QueryMonitorFromPoint { .. } => "QueryMonitorFromPoint",
             Self::QueryCurrentMonitor { .. } => "QueryCurrentMonitor",
             Self::RunOnMainThread { .. } => "RunOnMainThread",
+            Self::SetCursorVisible { .. } => "SetCursorVisible",
+            Self::SetCursorGrab { .. } => "SetCursorGrab",
+            Self::SetCursorIcon { .. } => "SetCursorIcon",
+            Self::SetCursorPosition { .. } => "SetCursorPosition",
+            Self::SetIgnoreCursorEvents { .. } => "SetIgnoreCursorEvents",
+            Self::SetMinSize { .. } => "SetMinSize",
+            Self::SetMaxSize { .. } => "SetMaxSize",
+            Self::SetAlwaysOnTop { .. } => "SetAlwaysOnTop",
+            Self::SetWindowTheme { .. } => "SetWindowTheme",
+            Self::StartDragging { .. } => "StartDragging",
+            Self::RequestUserAttention { .. } => "RequestUserAttention",
+            Self::CenterWindow { .. } => "CenterWindow",
+            Self::SetWindowIcon { .. } => "SetWindowIcon",
             Self::Exit { .. } => "Exit",
         };
         formatter.write_str(name)
@@ -1165,14 +1212,21 @@ impl<T: UserEvent> WindowDispatch<T> for ServocatWindowDispatch<T> {
     }
 
     fn center(&self) -> Result<()> {
-        Ok(())
+        self.proxy
+            .send_event(RuntimeEvent::CenterWindow { id: self.window_id })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn request_user_attention(
         &self,
-        _request_type: Option<tauri_runtime::UserAttentionType>,
+        request_type: Option<tauri_runtime::UserAttentionType>,
     ) -> Result<()> {
-        Ok(())
+        self.proxy
+            .send_event(RuntimeEvent::RequestUserAttention {
+                id: self.window_id,
+                request_type,
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn create_window<F: Fn(RawWindow) + Send + 'static>(
@@ -1289,8 +1343,13 @@ impl<T: UserEvent> WindowDispatch<T> for ServocatWindowDispatch<T> {
         Ok(())
     }
 
-    fn set_always_on_top(&self, _always_on_top: bool) -> Result<()> {
-        Ok(())
+    fn set_always_on_top(&self, always_on_top: bool) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::SetAlwaysOnTop {
+                id: self.window_id,
+                always_on_top,
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn set_visible_on_all_workspaces(&self, _visible_on_all_workspaces: bool) -> Result<()> {
@@ -1314,12 +1373,22 @@ impl<T: UserEvent> WindowDispatch<T> for ServocatWindowDispatch<T> {
             .map_err(|_e| Error::EventLoopClosed)
     }
 
-    fn set_min_size(&self, _size: Option<Size>) -> Result<()> {
-        Ok(())
+    fn set_min_size(&self, size: Option<Size>) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::SetMinSize {
+                id: self.window_id,
+                size,
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
-    fn set_max_size(&self, _size: Option<Size>) -> Result<()> {
-        Ok(())
+    fn set_max_size(&self, size: Option<Size>) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::SetMaxSize {
+                id: self.window_id,
+                size,
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn set_size_constraints(&self, _constraints: WindowSizeConstraints) -> Result<()> {
@@ -1359,36 +1428,70 @@ impl<T: UserEvent> WindowDispatch<T> for ServocatWindowDispatch<T> {
         Ok(())
     }
 
-    fn set_icon(&self, _icon: Icon<'_>) -> Result<()> {
-        Ok(())
+    fn set_icon(&self, icon: Icon<'_>) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::SetWindowIcon {
+                id: self.window_id,
+                rgba: icon.rgba.into_owned(),
+                width: icon.width,
+                height: icon.height,
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn set_skip_taskbar(&self, _skip: bool) -> Result<()> {
         Ok(())
     }
 
-    fn set_cursor_grab(&self, _grab: bool) -> Result<()> {
-        Ok(())
+    fn set_cursor_grab(&self, grab: bool) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::SetCursorGrab {
+                id: self.window_id,
+                grab,
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
-    fn set_cursor_visible(&self, _visible: bool) -> Result<()> {
-        Ok(())
+    fn set_cursor_visible(&self, visible: bool) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::SetCursorVisible {
+                id: self.window_id,
+                visible,
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
-    fn set_cursor_icon(&self, _icon: CursorIcon) -> Result<()> {
-        Ok(())
+    fn set_cursor_icon(&self, icon: CursorIcon) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::SetCursorIcon {
+                id: self.window_id,
+                icon,
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
-    fn set_cursor_position<Pos: Into<Position>>(&self, _position: Pos) -> Result<()> {
-        Ok(())
+    fn set_cursor_position<Pos: Into<Position>>(&self, position: Pos) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::SetCursorPosition {
+                id: self.window_id,
+                position: position.into(),
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
-    fn set_ignore_cursor_events(&self, _ignore: bool) -> Result<()> {
-        Ok(())
+    fn set_ignore_cursor_events(&self, ignore: bool) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::SetIgnoreCursorEvents {
+                id: self.window_id,
+                ignore,
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn start_dragging(&self) -> Result<()> {
-        Ok(())
+        self.proxy
+            .send_event(RuntimeEvent::StartDragging { id: self.window_id })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn start_resize_dragging(&self, _direction: tauri_runtime::ResizeDirection) -> Result<()> {
@@ -1423,8 +1526,13 @@ impl<T: UserEvent> WindowDispatch<T> for ServocatWindowDispatch<T> {
         Ok(())
     }
 
-    fn set_theme(&self, _theme: Option<Theme>) -> Result<()> {
-        Ok(())
+    fn set_theme(&self, theme: Option<Theme>) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::SetWindowTheme {
+                id: self.window_id,
+                theme,
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 }
 
@@ -1840,6 +1948,55 @@ fn try_http_url(url: &str) -> Option<String> {
     let request = net_cat::request::Request::new(net_cat::method::Method::Get, net_url);
     let response = net_cat::fetch(&request).ok()?;
     Some(response.body_text())
+}
+
+fn convert_size(size: Size) -> winit::dpi::Size {
+    match size {
+        Size::Logical(s) => winit::dpi::Size::Logical(LogicalSize::new(s.width, s.height)),
+        Size::Physical(s) => {
+            winit::dpi::Size::Physical(winit::dpi::PhysicalSize::new(s.width, s.height))
+        }
+    }
+}
+
+fn convert_cursor_icon(icon: CursorIcon) -> winit::window::CursorIcon {
+    match icon {
+        CursorIcon::Default | CursorIcon::Arrow => winit::window::CursorIcon::Default,
+        CursorIcon::Crosshair => winit::window::CursorIcon::Crosshair,
+        CursorIcon::Hand => winit::window::CursorIcon::Pointer,
+        CursorIcon::Move => winit::window::CursorIcon::Move,
+        CursorIcon::Text => winit::window::CursorIcon::Text,
+        CursorIcon::Wait => winit::window::CursorIcon::Wait,
+        CursorIcon::Help => winit::window::CursorIcon::Help,
+        CursorIcon::Progress => winit::window::CursorIcon::Progress,
+        CursorIcon::NotAllowed => winit::window::CursorIcon::NotAllowed,
+        CursorIcon::ContextMenu => winit::window::CursorIcon::ContextMenu,
+        CursorIcon::Cell => winit::window::CursorIcon::Cell,
+        CursorIcon::VerticalText => winit::window::CursorIcon::VerticalText,
+        CursorIcon::Alias => winit::window::CursorIcon::Alias,
+        CursorIcon::Copy => winit::window::CursorIcon::Copy,
+        CursorIcon::NoDrop => winit::window::CursorIcon::NoDrop,
+        CursorIcon::Grab => winit::window::CursorIcon::Grab,
+        CursorIcon::Grabbing => winit::window::CursorIcon::Grabbing,
+        CursorIcon::AllScroll => winit::window::CursorIcon::AllScroll,
+        CursorIcon::ZoomIn => winit::window::CursorIcon::ZoomIn,
+        CursorIcon::ZoomOut => winit::window::CursorIcon::ZoomOut,
+        CursorIcon::EResize => winit::window::CursorIcon::EResize,
+        CursorIcon::NResize => winit::window::CursorIcon::NResize,
+        CursorIcon::NeResize => winit::window::CursorIcon::NeResize,
+        CursorIcon::NwResize => winit::window::CursorIcon::NwResize,
+        CursorIcon::SResize => winit::window::CursorIcon::SResize,
+        CursorIcon::SeResize => winit::window::CursorIcon::SeResize,
+        CursorIcon::SwResize => winit::window::CursorIcon::SwResize,
+        CursorIcon::WResize => winit::window::CursorIcon::WResize,
+        CursorIcon::EwResize => winit::window::CursorIcon::EwResize,
+        CursorIcon::NsResize => winit::window::CursorIcon::NsResize,
+        CursorIcon::NeswResize => winit::window::CursorIcon::NeswResize,
+        CursorIcon::NwseResize => winit::window::CursorIcon::NwseResize,
+        CursorIcon::ColResize => winit::window::CursorIcon::ColResize,
+        CursorIcon::RowResize => winit::window::CursorIcon::RowResize,
+        _other => winit::window::CursorIcon::Default,
+    }
 }
 
 fn winit_monitor_to_tauri(handle: &winit::monitor::MonitorHandle) -> Monitor {
@@ -2337,6 +2494,144 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                         winit::window::Theme::Dark => Theme::Dark,
                     });
                 let _ = reply.send(theme);
+            }
+            RuntimeEvent::SetCursorVisible { id, visible } => {
+                let raw = raw_window_id(id);
+                let _ = self
+                    .windows
+                    .get(&raw)
+                    .map(|window| window.set_cursor_visible(visible));
+            }
+            RuntimeEvent::SetCursorGrab { id, grab } => {
+                let raw = raw_window_id(id);
+                let mode = if grab {
+                    winit::window::CursorGrabMode::Confined
+                } else {
+                    winit::window::CursorGrabMode::None
+                };
+                let _ = self
+                    .windows
+                    .get(&raw)
+                    .map(|window| window.set_cursor_grab(mode));
+            }
+            RuntimeEvent::SetCursorIcon { id, icon } => {
+                let raw = raw_window_id(id);
+                let winit_icon = convert_cursor_icon(icon);
+                let _ = self
+                    .windows
+                    .get(&raw)
+                    .map(|window| window.set_cursor(winit_icon));
+            }
+            RuntimeEvent::SetCursorPosition { id, position } => {
+                let raw = raw_window_id(id);
+                let _ = self.windows.get(&raw).map(|window| match position {
+                    Position::Logical(p) => {
+                        let _ = window.set_cursor_position(LogicalPosition::new(p.x, p.y));
+                    }
+                    Position::Physical(p) => {
+                        let _ =
+                            window.set_cursor_position(winit::dpi::PhysicalPosition::new(p.x, p.y));
+                    }
+                });
+            }
+            RuntimeEvent::SetIgnoreCursorEvents { id, ignore } => {
+                let raw = raw_window_id(id);
+                let _ = self
+                    .windows
+                    .get(&raw)
+                    .map(|window| window.set_cursor_hittest(!ignore));
+            }
+            RuntimeEvent::SetMinSize { id, size } => {
+                let raw = raw_window_id(id);
+                let _ = self
+                    .windows
+                    .get(&raw)
+                    .map(|window| window.set_min_inner_size(size.map(convert_size)));
+            }
+            RuntimeEvent::SetMaxSize { id, size } => {
+                let raw = raw_window_id(id);
+                let _ = self
+                    .windows
+                    .get(&raw)
+                    .map(|window| window.set_max_inner_size(size.map(convert_size)));
+            }
+            RuntimeEvent::SetAlwaysOnTop { id, always_on_top } => {
+                let raw = raw_window_id(id);
+                let level = if always_on_top {
+                    winit::window::WindowLevel::AlwaysOnTop
+                } else {
+                    winit::window::WindowLevel::Normal
+                };
+                let _ = self
+                    .windows
+                    .get(&raw)
+                    .map(|window| window.set_window_level(level));
+            }
+            RuntimeEvent::SetWindowTheme { id, theme } => {
+                let raw = raw_window_id(id);
+                let winit_theme = theme.map(|t| match t {
+                    Theme::Light => winit::window::Theme::Light,
+                    Theme::Dark => winit::window::Theme::Dark,
+                    _other => winit::window::Theme::Light,
+                });
+                let _ = self
+                    .windows
+                    .get(&raw)
+                    .map(|window| window.set_theme(winit_theme));
+            }
+            RuntimeEvent::StartDragging { id } => {
+                let raw = raw_window_id(id);
+                let _ = self.windows.get(&raw).map(Window::drag_window);
+            }
+            RuntimeEvent::RequestUserAttention { id, request_type } => {
+                let raw = raw_window_id(id);
+                let winit_attention = request_type.map(|t| match t {
+                    tauri_runtime::UserAttentionType::Critical => {
+                        winit::window::UserAttentionType::Critical
+                    }
+                    tauri_runtime::UserAttentionType::Informational => {
+                        winit::window::UserAttentionType::Informational
+                    }
+                });
+                let _ = self
+                    .windows
+                    .get(&raw)
+                    .map(|window| window.request_user_attention(winit_attention));
+            }
+            RuntimeEvent::CenterWindow { id } => {
+                let raw = raw_window_id(id);
+                let _ = self.windows.get(&raw).map(|window| {
+                    let _ = window.current_monitor().map(|monitor| {
+                        let monitor_size = monitor.size();
+                        let monitor_pos = monitor.position();
+                        let window_size = window.outer_size();
+                        let x = monitor_pos.x
+                            + i32::try_from(monitor_size.width.saturating_sub(window_size.width))
+                                .unwrap_or(0)
+                                / 2;
+                        let y = monitor_pos.y
+                            + i32::try_from(monitor_size.height.saturating_sub(window_size.height))
+                                .unwrap_or(0)
+                                / 2;
+                        window.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+                    });
+                });
+            }
+            RuntimeEvent::SetWindowIcon {
+                id,
+                rgba,
+                width,
+                height,
+            } => {
+                let raw = raw_window_id(id);
+                let _ = winit::window::Icon::from_rgba(rgba, width, height)
+                    .ok()
+                    .map(|winit_icon| {
+                        let _ = self
+                            .windows
+                            .get(&raw)
+                            .map(|window| window.set_window_icon(Some(winit_icon)));
+                    });
             }
             RuntimeEvent::Exit { code: _ } => {
                 event_loop.exit();
