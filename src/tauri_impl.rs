@@ -1,4 +1,4 @@
-//! v1.8 implementation of the `tauri_runtime::Runtime` trait surface.
+//! v1.9 implementation of the `tauri_runtime::Runtime` trait surface.
 //!
 //! Backed by a real winit event loop with per-window softbuffer
 //! presentation:
@@ -425,6 +425,9 @@ pub enum RuntimeEvent<T: UserEvent> {
         url: Url,
         reply: mpsc::Sender<Vec<Cookie<'static>>>,
     },
+    /// Rasterizes the webview's current frame to a PNG and writes it
+    /// to the OS temp directory.  Used by [`WebviewDispatch::print`].
+    PrintWebview { id: WindowId },
     /// Asks the runtime to exit with the given code.
     Exit { code: i32 },
 }
@@ -512,6 +515,7 @@ impl<T: UserEvent> std::fmt::Debug for RuntimeEvent<T> {
             Self::ClearWebviewBrowsingData { .. } => "ClearWebviewBrowsingData",
             Self::QueryWebviewCookies { .. } => "QueryWebviewCookies",
             Self::QueryWebviewCookiesForUrl { .. } => "QueryWebviewCookiesForUrl",
+            Self::PrintWebview { .. } => "PrintWebview",
             Self::Exit { .. } => "Exit",
         };
         formatter.write_str(name)
@@ -1708,11 +1712,19 @@ impl<T: UserEvent> WebviewDispatch<T> for ServocatWebviewDispatch<T> {
         0
     }
 
-    fn with_webview<F: FnOnce(Box<dyn std::any::Any>) + Send + 'static>(
-        &self,
-        _f: F,
-    ) -> Result<()> {
-        Err(Error::FailedToSendMessage)
+    fn with_webview<F: FnOnce(Box<dyn std::any::Any>) + Send + 'static>(&self, f: F) -> Result<()> {
+        // No native webview handle exists in the cat-stack runtime, so
+        // the closure can't introspect a platform webview; we still
+        // ship it to the main thread with `Box::new(())` so callers
+        // that use `with_webview` purely to schedule a host-side
+        // closure on the main thread (a common Tauri pattern) get the
+        // synchronous-dispatch behaviour they expect.
+        let thunk: Box<dyn FnOnce() + Send + 'static> = Box::new(move || {
+            f(Box::new(()));
+        });
+        self.proxy
+            .send_event(RuntimeEvent::RunOnMainThread { thunk })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     #[cfg(any(debug_assertions, feature = "devtools"))]
@@ -1769,7 +1781,9 @@ impl<T: UserEvent> WebviewDispatch<T> for ServocatWebviewDispatch<T> {
     }
 
     fn print(&self) -> Result<()> {
-        Err(Error::FailedToSendMessage)
+        self.proxy
+            .send_event(RuntimeEvent::PrintWebview { id: self.window_id })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn close(&self) -> Result<()> {
@@ -2214,6 +2228,37 @@ fn try_http_url(url: &str) -> Option<String> {
     let request = net_cat::request::Request::new(net_cat::method::Method::Get, net_url);
     let response = net_cat::fetch(&request).ok()?;
     Some(response.body_text())
+}
+
+fn print_to_png(
+    frame: &Frame,
+    width: u32,
+    height: u32,
+    label: &str,
+    text_renderer: &mut TextRenderer,
+) -> Option<std::path::PathBuf> {
+    let pixels = render_to_pixels_with(frame, width, height, text_renderer);
+    // FFI carve-out: tiny-skia's `Pixmap` requires `&mut` for
+    // `data_mut`; we copy our rasterized RGBA into it so the
+    // PNG-format encoder can serialize the same bytes that
+    // softbuffer displays.
+    let mut pixmap = tiny_skia::Pixmap::new(width, height)?;
+    let data = pixmap.data_mut();
+    (data.len() == pixels.rgba().len()).then_some(())?;
+    data.copy_from_slice(pixels.rgba());
+    let png = pixmap.encode_png().ok()?;
+    let safe_label: String = label
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    let stem = if safe_label.is_empty() {
+        "webview".to_owned()
+    } else {
+        safe_label
+    };
+    let path = std::env::temp_dir().join(format!("tauri-runtime-servocat-print-{stem}.png"));
+    std::fs::write(&path, png).ok()?;
+    Some(path)
 }
 
 fn convert_size(size: Size) -> winit::dpi::Size {
@@ -3073,6 +3118,30 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                     .map(|webview| webview.cookies.clone())
                     .unwrap_or_default();
                 let _ = reply.send(value);
+            }
+            RuntimeEvent::PrintWebview { id } => {
+                let raw = raw_window_id(id);
+                let size = self
+                    .windows
+                    .get(&raw)
+                    .map(winit::window::Window::inner_size);
+                let _ = size.and_then(|sz| {
+                    self.webviews.get_mut(&raw).and_then(|webview| {
+                        let WebviewState {
+                            current_frame,
+                            text_renderer,
+                            label,
+                            ..
+                        } = webview;
+                        let frame = current_frame.as_ref()?;
+                        print_to_png(frame, sz.width, sz.height, label, text_renderer).map(|path| {
+                            println!(
+                                "[tauri-runtime-servocat] print: wrote frame to {}",
+                                path.display()
+                            );
+                        })
+                    })
+                });
             }
             RuntimeEvent::QueryWebviewCookiesForUrl { id, url, reply } => {
                 let raw = raw_window_id(id);
