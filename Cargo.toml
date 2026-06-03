@@ -1,8 +1,8 @@
 [package]
 name = "tauri-runtime-servocat"
-version = "1.7.0"
+version = "1.8.0"
 edition = "2024"
-description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v1.7.0 adds per-window `WindowFlags` bookkeeping so `is_enabled` / `is_maximizable` / `is_minimizable` / `is_closable` / `is_always_on_top` / `is_focusable` round-trip real values from their matching setters; webview `bounds` / `position` / `size` queries now return tracked values updated by `set_bounds` / `set_size` / `set_position`.  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
+description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v1.8.0 adds per-webview tracking for zoom, background colour, auto-resize, and an in-memory cookie jar (`set_cookie` / `delete_cookie` / `cookies` / `cookies_for_url` / `clear_all_browsing_data`).  When a window resizes, webviews that opted into auto-resize update their bounds to match.  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
 license = "MIT OR Apache-2.0"
 keywords = ["tauri", "runtime", "browser", "servo", "type-driven"]
 categories = ["gui", "rendering"]

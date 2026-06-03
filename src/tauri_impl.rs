@@ -1,4 +1,4 @@
-//! v1.7 implementation of the `tauri_runtime::Runtime` trait surface.
+//! v1.8 implementation of the `tauri_runtime::Runtime` trait surface.
 //!
 //! Backed by a real winit event loop with per-window softbuffer
 //! presentation:
@@ -394,6 +394,37 @@ pub enum RuntimeEvent<T: UserEvent> {
         id: WindowId,
         reply: mpsc::Sender<PhysicalSize<u32>>,
     },
+    /// Updates the tracked zoom factor of a webview.
+    SetWebviewZoom { id: WindowId, scale: f64 },
+    /// Updates the tracked background color of a webview.
+    SetWebviewBackgroundColor { id: WindowId, color: Option<Color> },
+    /// Updates the tracked auto-resize flag of a webview.
+    SetWebviewAutoResize { id: WindowId, auto_resize: bool },
+    /// Appends a cookie to the webview's in-memory cookie jar
+    /// (replacing any existing entry with the same name).
+    AddWebviewCookie {
+        id: WindowId,
+        cookie: Cookie<'static>,
+    },
+    /// Removes a cookie from the webview's in-memory cookie jar.
+    RemoveWebviewCookie {
+        id: WindowId,
+        cookie: Cookie<'static>,
+    },
+    /// Clears the webview's in-memory cookie jar.
+    ClearWebviewBrowsingData { id: WindowId },
+    /// Asks the handler for the full cookie jar of a webview.
+    QueryWebviewCookies {
+        id: WindowId,
+        reply: mpsc::Sender<Vec<Cookie<'static>>>,
+    },
+    /// Asks the handler for the cookies in a webview's jar matching
+    /// the given URL's host.
+    QueryWebviewCookiesForUrl {
+        id: WindowId,
+        url: Url,
+        reply: mpsc::Sender<Vec<Cookie<'static>>>,
+    },
     /// Asks the runtime to exit with the given code.
     Exit { code: i32 },
 }
@@ -473,6 +504,14 @@ impl<T: UserEvent> std::fmt::Debug for RuntimeEvent<T> {
             Self::QueryWebviewBounds { .. } => "QueryWebviewBounds",
             Self::QueryWebviewPosition { .. } => "QueryWebviewPosition",
             Self::QueryWebviewSize { .. } => "QueryWebviewSize",
+            Self::SetWebviewZoom { .. } => "SetWebviewZoom",
+            Self::SetWebviewBackgroundColor { .. } => "SetWebviewBackgroundColor",
+            Self::SetWebviewAutoResize { .. } => "SetWebviewAutoResize",
+            Self::AddWebviewCookie { .. } => "AddWebviewCookie",
+            Self::RemoveWebviewCookie { .. } => "RemoveWebviewCookie",
+            Self::ClearWebviewBrowsingData { .. } => "ClearWebviewBrowsingData",
+            Self::QueryWebviewCookies { .. } => "QueryWebviewCookies",
+            Self::QueryWebviewCookiesForUrl { .. } => "QueryWebviewCookiesForUrl",
             Self::Exit { .. } => "Exit",
         };
         formatter.write_str(name)
@@ -1807,36 +1846,72 @@ impl<T: UserEvent> WebviewDispatch<T> for ServocatWebviewDispatch<T> {
         Err(Error::WindowNotFound)
     }
 
-    fn cookies_for_url(&self, _url: Url) -> Result<Vec<Cookie<'static>>> {
-        Ok(Vec::new())
+    fn cookies_for_url(&self, url: Url) -> Result<Vec<Cookie<'static>>> {
+        query(&self.proxy, |reply| {
+            RuntimeEvent::QueryWebviewCookiesForUrl {
+                id: self.window_id,
+                url,
+                reply,
+            }
+        })
     }
 
     fn cookies(&self) -> Result<Vec<Cookie<'static>>> {
-        Ok(Vec::new())
+        query(&self.proxy, |reply| RuntimeEvent::QueryWebviewCookies {
+            id: self.window_id,
+            reply,
+        })
     }
 
-    fn set_cookie(&self, _cookie: Cookie<'_>) -> Result<()> {
-        Err(Error::FailedToSendMessage)
+    fn set_cookie(&self, cookie: Cookie<'_>) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::AddWebviewCookie {
+                id: self.window_id,
+                cookie: cookie.into_owned(),
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
-    fn delete_cookie(&self, _cookie: Cookie<'_>) -> Result<()> {
-        Err(Error::FailedToSendMessage)
+    fn delete_cookie(&self, cookie: Cookie<'_>) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::RemoveWebviewCookie {
+                id: self.window_id,
+                cookie: cookie.into_owned(),
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
-    fn set_auto_resize(&self, _auto_resize: bool) -> Result<()> {
-        Ok(())
+    fn set_auto_resize(&self, auto_resize: bool) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::SetWebviewAutoResize {
+                id: self.window_id,
+                auto_resize,
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
-    fn set_zoom(&self, _scale_factor: f64) -> Result<()> {
-        Ok(())
+    fn set_zoom(&self, scale_factor: f64) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::SetWebviewZoom {
+                id: self.window_id,
+                scale: scale_factor,
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
-    fn set_background_color(&self, _color: Option<Color>) -> Result<()> {
-        Ok(())
+    fn set_background_color(&self, color: Option<Color>) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::SetWebviewBackgroundColor {
+                id: self.window_id,
+                color,
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn clear_all_browsing_data(&self) -> Result<()> {
-        Ok(())
+        self.proxy
+            .send_event(RuntimeEvent::ClearWebviewBrowsingData { id: self.window_id })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 }
 
@@ -2023,6 +2098,10 @@ struct WebviewState<T: UserEvent> {
     text_renderer: TextRenderer,
     ipc_handler: Option<WebviewIpcHandler<T, ServocatRuntime<T>>>,
     bounds: Rect,
+    zoom: f64,
+    background_color: Option<Color>,
+    auto_resize: bool,
+    cookies: Vec<Cookie<'static>>,
 }
 
 impl<T: UserEvent> WebviewState<T> {
@@ -2047,6 +2126,10 @@ impl<T: UserEvent> WebviewState<T> {
                     viewport.height(),
                 )),
             },
+            zoom: 1.0,
+            background_color: None,
+            auto_resize: false,
+            cookies: Vec::new(),
         }
     }
 
@@ -2939,6 +3022,77 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                 );
                 let _ = reply.send(value);
             }
+            RuntimeEvent::SetWebviewZoom { id, scale } => {
+                let raw = raw_window_id(id);
+                let _ = self.webviews.get_mut(&raw).map(|webview| {
+                    webview.zoom = scale;
+                });
+            }
+            RuntimeEvent::SetWebviewBackgroundColor { id, color } => {
+                let raw = raw_window_id(id);
+                let _ = self.webviews.get_mut(&raw).map(|webview| {
+                    webview.background_color = color;
+                });
+            }
+            RuntimeEvent::SetWebviewAutoResize { id, auto_resize } => {
+                let raw = raw_window_id(id);
+                let _ = self.webviews.get_mut(&raw).map(|webview| {
+                    webview.auto_resize = auto_resize;
+                });
+            }
+            RuntimeEvent::AddWebviewCookie { id, cookie } => {
+                let raw = raw_window_id(id);
+                let _ = self.webviews.get_mut(&raw).map(|webview| {
+                    let name = cookie.name().to_owned();
+                    webview
+                        .cookies
+                        .retain(|existing| existing.name() != name.as_str());
+                    webview.cookies.push(cookie);
+                });
+            }
+            RuntimeEvent::RemoveWebviewCookie { id, cookie } => {
+                let raw = raw_window_id(id);
+                let _ = self.webviews.get_mut(&raw).map(|webview| {
+                    let name = cookie.name().to_owned();
+                    webview
+                        .cookies
+                        .retain(|existing| existing.name() != name.as_str());
+                });
+            }
+            RuntimeEvent::ClearWebviewBrowsingData { id } => {
+                let raw = raw_window_id(id);
+                let _ = self.webviews.get_mut(&raw).map(|webview| {
+                    webview.cookies.clear();
+                });
+            }
+            RuntimeEvent::QueryWebviewCookies { id, reply } => {
+                let raw = raw_window_id(id);
+                let value = self
+                    .webviews
+                    .get(&raw)
+                    .map(|webview| webview.cookies.clone())
+                    .unwrap_or_default();
+                let _ = reply.send(value);
+            }
+            RuntimeEvent::QueryWebviewCookiesForUrl { id, url, reply } => {
+                let raw = raw_window_id(id);
+                let host = url.host_str().unwrap_or("").to_owned();
+                let value = self
+                    .webviews
+                    .get(&raw)
+                    .map(|webview| {
+                        webview
+                            .cookies
+                            .iter()
+                            .filter(|cookie| {
+                                cookie.domain().is_none_or(|domain| domain == host.as_str())
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let _ = reply.send(value);
+            }
             RuntimeEvent::QueryWebviewSize { id, reply } => {
                 let raw = raw_window_id(id);
                 let value = self.webviews.get(&raw).map_or_else(
@@ -3007,6 +3161,17 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                         raw,
                         TauriWindowEvent::Resized(PhysicalSize::new(size.width, size.height)),
                     );
+                    let _ = self.webviews.get_mut(&raw).map(|webview| {
+                        if webview.auto_resize {
+                            webview.bounds = Rect {
+                                position: Position::Physical(PhysicalPosition::new(0, 0)),
+                                size: tauri_runtime::dpi::Size::Physical(PhysicalSize::new(
+                                    size.width,
+                                    size.height,
+                                )),
+                            };
+                        }
+                    });
                 });
             }
             WinitWindowEvent::Moved(position) => {
