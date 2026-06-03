@@ -1,8 +1,8 @@
 [package]
 name = "tauri-runtime-servocat"
-version = "1.5.0"
+version = "1.5.1"
 edition = "2024"
-description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v1.5.0 plumbs `PendingWebview::ipc_handler` so a Tauri app's `tauri::Builder::invoke_handler` is stored alongside the webview and can be fired through the inherent `ServocatWebviewDispatch::send_ipc(request)` method (the Rust-side half of the JS<->host IPC bridge).  This closes the committed 1.x roadmap; subsequent 1.x patch releases will wire the JS-side `__TAURI_INTERNALS__.postMessage` bridge through to the same handler.  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
+description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v1.5.1 wires the JS side of the IPC bridge: when a webview's script calls `__TAURI__.post_ipc_message(payload)`, our `NativeFn` shim fires the same `WebviewIpcHandler` that `send_ipc(request)` does, so a Tauri app's `tauri::Builder::invoke_handler` is reachable from JS running in boa-cat.  Thread-local proxy state threads through the bare-fn-pointer `NativeFn` constraint; otherwise no shared mutable state.  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
 license = "MIT OR Apache-2.0"
 keywords = ["tauri", "runtime", "browser", "servo", "type-driven"]
 categories = ["gui", "rendering"]

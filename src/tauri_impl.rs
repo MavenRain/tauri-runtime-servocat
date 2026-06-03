@@ -1,4 +1,4 @@
-//! v1.5 implementation of the `tauri_runtime::Runtime` trait surface.
+//! v1.5.1 implementation of the `tauri_runtime::Runtime` trait surface.
 //!
 //! Backed by a real winit event loop with per-window softbuffer
 //! presentation:
@@ -61,12 +61,18 @@
     unexpected_cfgs
 )]
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
+
+use boa_cat::Value;
+use boa_cat::fuel::Fuel;
+use boa_cat::heap::Heap as BoaHeap;
+use boa_cat::outcome::{EvalResult, Outcome};
 
 use cookie::Cookie;
 use raw_window_handle::{DisplayHandle, HandleError, WindowHandle};
@@ -1652,6 +1658,74 @@ fn queue_webview<T: UserEvent>(
     })
 }
 
+/// JS-side -> Rust-side IPC dispatch trait.  Implemented for each
+/// `T: UserEvent`, but stored type-erased in [`IPC_DISPATCH`] so
+/// boa-cat's bare-fn-pointer [`NativeFn`] shim can reach it.
+trait IpcDispatch {
+    fn dispatch(&self, request: http::Request<String>);
+}
+
+struct IpcDispatchImpl<T: UserEvent> {
+    proxy: EventLoopProxy<RuntimeEvent<T>>,
+    window_id: WindowId,
+}
+
+impl<T: UserEvent> IpcDispatch for IpcDispatchImpl<T> {
+    fn dispatch(&self, request: http::Request<String>) {
+        let _ = self.proxy.send_event(RuntimeEvent::IpcRequest {
+            window_id: self.window_id,
+            request,
+        });
+    }
+}
+
+thread_local! {
+    // FFI carve-out: boa-cat's `NativeFn` is a bare `fn` pointer
+    // (no closure capture); we stash a type-erased dispatcher in
+    // thread-local storage for the duration of one eval so the
+    // `post_ipc_message` shim can reach the runtime's event-loop
+    // proxy.  Set + cleared by [`AppHandler::eval_with_ipc_bridge`].
+    static IPC_DISPATCH: RefCell<Option<Box<dyn IpcDispatch>>> =
+        const { RefCell::new(None) };
+}
+
+/// `__TAURI__.post_ipc_message(payload)` shim: stringifies its first
+/// argument, wraps it in an `http::Request<String>` with the
+/// `ipc://post-message` URI, and fires a [`RuntimeEvent::IpcRequest`]
+/// through the thread-local dispatcher set by the current eval.
+///
+/// # Errors
+///
+/// Never returns `Err`; if the request fails to build or no
+/// dispatcher is active the message is silently dropped (no
+/// dispatcher means we're being called outside a webview eval).
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+fn post_ipc_message_impl(args: Vec<Value>, _this: Value, heap: BoaHeap, fuel: Fuel) -> EvalResult {
+    let body = args.first().map_or_else(String::new, |value| match value {
+        Value::String(s) => s.clone(),
+        Value::Undefined
+        | Value::Null
+        | Value::Boolean(_)
+        | Value::Number(_)
+        | Value::Object(_)
+        | Value::Function(_)
+        | Value::Native(_) => format!("{value}"),
+    });
+    let _ = http::Request::builder()
+        .uri("ipc://post-message")
+        .body(body)
+        .ok()
+        .map(|request| {
+            IPC_DISPATCH.with(|slot| {
+                let _ = slot
+                    .borrow()
+                    .as_ref()
+                    .map(|dispatcher| dispatcher.dispatch(request));
+            });
+        });
+    Ok((Outcome::Normal(Value::Undefined), heap, fuel))
+}
+
 /// Per-window webview state held by [`AppHandler`].  v1.2 keeps the
 /// caller-supplied HTML/CSS so `reload` + `eval_script` can rebuild
 /// the pipeline without re-fetching; v1.5 adds the label + optional
@@ -1695,13 +1769,33 @@ impl<T: UserEvent> WebviewState<T> {
             &self.css,
             script,
             self.viewport,
-            &HostCommands::new(),
+            &HostCommands::new().with("post_ipc_message", post_ipc_message_impl),
         )
         .ok()?;
         let value = format!("{}", frame.script_value());
         self.current_frame = Some(frame);
         Some(value)
     }
+}
+
+/// Install a thread-local IPC dispatcher pointing at the given
+/// window for the duration of `body`, then clear it.  Used by the
+/// `EvalScript` / `EvalScriptWithCallback` handler arms so the
+/// `post_ipc_message` shim can reach the right window's `ipc_handler`.
+fn with_ipc_dispatch<T: UserEvent, R>(
+    proxy: EventLoopProxy<RuntimeEvent<T>>,
+    window_id: WindowId,
+    body: impl FnOnce() -> R,
+) -> R {
+    let dispatcher: Box<dyn IpcDispatch> = Box::new(IpcDispatchImpl { proxy, window_id });
+    IPC_DISPATCH.with(|slot| {
+        let _ = slot.borrow_mut().replace(dispatcher);
+    });
+    let result = body();
+    IPC_DISPATCH.with(|slot| {
+        let _ = slot.borrow_mut().take();
+    });
+    result
 }
 
 /// Extract a usable HTML body from a URL.  v1.4 handles
@@ -2041,10 +2135,13 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
             }
             RuntimeEvent::EvalScript { window_id, script } => {
                 let raw = raw_window_id(window_id);
-                let _ = self
-                    .webviews
-                    .get_mut(&raw)
-                    .map(|webview| webview.eval(&script));
+                let proxy = self.proxy.clone();
+                with_ipc_dispatch(proxy, window_id, || {
+                    let _ = self
+                        .webviews
+                        .get_mut(&raw)
+                        .map(|webview| webview.eval(&script));
+                });
                 self.request_redraw(raw);
             }
             RuntimeEvent::EvalScriptWithCallback {
@@ -2053,11 +2150,13 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                 callback,
             } => {
                 let raw = raw_window_id(window_id);
-                let result = self
-                    .webviews
-                    .get_mut(&raw)
-                    .and_then(|webview| webview.eval(&script))
-                    .unwrap_or_default();
+                let proxy = self.proxy.clone();
+                let result = with_ipc_dispatch(proxy, window_id, || {
+                    self.webviews
+                        .get_mut(&raw)
+                        .and_then(|webview| webview.eval(&script))
+                        .unwrap_or_default()
+                });
                 callback(result);
                 self.request_redraw(raw);
             }
