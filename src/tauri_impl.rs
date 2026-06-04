@@ -1,4 +1,4 @@
-//! v3.0 implementation of the `tauri_runtime::Runtime` trait surface.
+//! v3.1 implementation of the `tauri_runtime::Runtime` trait surface.
 //!
 //! Backed by a real winit event loop with per-window softbuffer
 //! presentation:
@@ -104,7 +104,6 @@ use crate::raster::{PixelBuffer, render_commands_to_pixels_with, render_to_pixel
 use crate::script::run_script_with_backprop;
 use crate::text::TextRenderer;
 use layout_cat::Viewport;
-use paint_cat::PaintCommand;
 
 static NEXT_WINDOW_ID: AtomicU32 = AtomicU32::new(1);
 static NEXT_WEBVIEW_ID: AtomicU32 = AtomicU32::new(1);
@@ -2548,8 +2547,16 @@ fn present_webview<T: UserEvent>(window: &Window, webview: &mut WebviewState<T>)
     let pixels = if (zoom - 1.0).abs() < f64::EPSILON {
         render_to_pixels_with(frame, size.width, size.height, &mut webview.text_renderer)
     } else {
-        let scaled = scale_paint_commands(frame.display_list().commands(), zoom);
-        render_commands_to_pixels_with(&scaled, size.width, size.height, &mut webview.text_renderer)
+        // v3.1: delegate the per-variant scaling to paint-cat 0.2's
+        // upstream `DisplayList::scaled`, which we re-export through
+        // the `commands()` accessor.
+        let scaled = frame.display_list().scaled(zoom);
+        render_commands_to_pixels_with(
+            scaled.commands(),
+            size.width,
+            size.height,
+            &mut webview.text_renderer,
+        )
     };
     let context = Context::new(window).ok()?;
     // FFI carve-out: softbuffer's `Surface` / `Buffer` require `&mut`
@@ -2560,54 +2567,6 @@ fn present_webview<T: UserEvent>(window: &Window, webview: &mut WebviewState<T>)
     write_pixels(&pixels, background, &mut buffer);
     buffer.present().ok()?;
     Some(())
-}
-
-fn scale_paint_commands(commands: &[PaintCommand], scale: f64) -> Vec<PaintCommand> {
-    use layout_cat::{Point, Rect as LayoutRect};
-    commands
-        .iter()
-        .map(|cmd| match cmd {
-            PaintCommand::FillRect { rect, color } => PaintCommand::FillRect {
-                rect: scale_rect(rect, scale, |x, y, w, h| {
-                    LayoutRect::new(Point::new(x, y), w, h)
-                }),
-                color: *color,
-            },
-            PaintCommand::StrokeRect { rect, color, width } => PaintCommand::StrokeRect {
-                rect: scale_rect(rect, scale, |x, y, w, h| {
-                    LayoutRect::new(Point::new(x, y), w, h)
-                }),
-                color: *color,
-                width: width * scale,
-            },
-            PaintCommand::FillText {
-                rect,
-                text,
-                color,
-                font_size,
-            } => PaintCommand::FillText {
-                rect: scale_rect(rect, scale, |x, y, w, h| {
-                    LayoutRect::new(Point::new(x, y), w, h)
-                }),
-                text: text.clone(),
-                color: *color,
-                font_size: font_size * scale,
-            },
-        })
-        .collect()
-}
-
-fn scale_rect(
-    rect: &layout_cat::Rect,
-    scale: f64,
-    builder: impl Fn(f64, f64, f64, f64) -> layout_cat::Rect,
-) -> layout_cat::Rect {
-    builder(
-        rect.origin().x() * scale,
-        rect.origin().y() * scale,
-        rect.width() * scale,
-        rect.height() * scale,
-    )
 }
 
 fn write_pixels(
@@ -3598,10 +3557,8 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
 }
 
 #[cfg(test)]
-#[allow(clippy::float_cmp)]
 mod tests {
-    use super::{Cookie, PaintCommand, merge_cookies, scale_paint_commands};
-    use layout_cat::{Color, Point, Rect};
+    use super::{Cookie, merge_cookies};
 
     fn fail(_msg: &'static str) -> tauri_runtime::Error {
         tauri_runtime::Error::FailedToReceiveMessage
@@ -3627,68 +3584,5 @@ mod tests {
         (names.iter().any(|n| n == "theme") && names.iter().any(|n| n == "lang"))
             .then_some(())
             .ok_or_else(|| fail("expected both theme and lang to be present"))
-    }
-
-    #[test]
-    fn scale_fillrect_scales_geometry() -> Result<(), tauri_runtime::Error> {
-        let input = vec![PaintCommand::FillRect {
-            rect: Rect::new(Point::new(10.0, 20.0), 100.0, 50.0),
-            color: Color::rgba(0.0, 0.0, 0.0, 1.0),
-        }];
-        let scaled = scale_paint_commands(&input, 2.0);
-        let first = scaled.first().ok_or_else(|| fail("empty result"))?;
-        match first {
-            PaintCommand::FillRect { rect, .. } => (rect.origin().x() == 20.0
-                && rect.origin().y() == 40.0
-                && rect.width() == 200.0
-                && rect.height() == 100.0)
-                .then_some(())
-                .ok_or_else(|| fail("FillRect geometry did not double")),
-            PaintCommand::StrokeRect { .. } | PaintCommand::FillText { .. } => {
-                Err(fail("expected FillRect variant"))
-            }
-        }
-    }
-
-    #[test]
-    fn scale_filltext_scales_font_size() -> Result<(), tauri_runtime::Error> {
-        let input = vec![PaintCommand::FillText {
-            rect: Rect::new(Point::new(0.0, 0.0), 100.0, 30.0),
-            text: "hi".to_owned(),
-            color: Color::rgba(0.0, 0.0, 0.0, 1.0),
-            font_size: 16.0,
-        }];
-        let scaled = scale_paint_commands(&input, 1.5);
-        let first = scaled.first().ok_or_else(|| fail("empty result"))?;
-        match first {
-            PaintCommand::FillText {
-                font_size, rect, ..
-            } => ((*font_size - 24.0).abs() < f64::EPSILON
-                && (rect.width() - 150.0).abs() < f64::EPSILON)
-                .then_some(())
-                .ok_or_else(|| fail("FillText font_size or rect did not scale")),
-            PaintCommand::FillRect { .. } | PaintCommand::StrokeRect { .. } => {
-                Err(fail("expected FillText variant"))
-            }
-        }
-    }
-
-    #[test]
-    fn scale_strokerect_scales_width() -> Result<(), tauri_runtime::Error> {
-        let input = vec![PaintCommand::StrokeRect {
-            rect: Rect::new(Point::new(0.0, 0.0), 100.0, 50.0),
-            color: Color::rgba(0.0, 0.0, 0.0, 1.0),
-            width: 2.0,
-        }];
-        let scaled = scale_paint_commands(&input, 3.0);
-        let first = scaled.first().ok_or_else(|| fail("empty result"))?;
-        match first {
-            PaintCommand::StrokeRect { width, .. } => ((*width - 6.0).abs() < f64::EPSILON)
-                .then_some(())
-                .ok_or_else(|| fail("StrokeRect width did not triple")),
-            PaintCommand::FillRect { .. } | PaintCommand::FillText { .. } => {
-                Err(fail("expected StrokeRect variant"))
-            }
-        }
     }
 }

@@ -1,8 +1,8 @@
 [package]
 name = "tauri-runtime-servocat"
-version = "3.0.0"
+version = "3.1.0"
 edition = "2024"
-description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.0.0 makes zoom truly crisp: at present time the display list is scaled by `webview.zoom` (rect coords + stroke width + font_size), then re-rasterized via cosmic-text at the larger glyph size before being blitted to softbuffer.  Text appears 2x larger at zoom=2.0 because the rasterizer actually rasterizes glyphs at 2x font_size, not because bitmap pixels are sample-replicated.  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
+description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.1.0 replaces the local `scale_paint_commands` helper with paint-cat 0.2's upstream `PaintCommand::scaled(factor)` / `DisplayList::scaled(factor)` API, so the per-variant scaling logic lives in the crate that owns the display-list type.  Zoom semantics are unchanged from v3.0; the rasterizer still re-draws at the larger size for crisp text.  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
 license = "MIT OR Apache-2.0"
 keywords = ["tauri", "runtime", "browser", "servo", "type-driven"]
 categories = ["gui", "rendering"]
@@ -12,7 +12,7 @@ html-cat = "0.1"
 css-cat = "0.1"
 dom-cat = "0.1"
 layout-cat = "0.1"
-paint-cat = "0.1"
+paint-cat = "0.2"
 net-cat = "0.1"
 boa-cat = "0.2"
 ecma-runtime-cat = "0.1"
