@@ -1,4 +1,4 @@
-//! v3.2 implementation of the `tauri_runtime::Runtime` trait surface.
+//! v3.3 implementation of the `tauri_runtime::Runtime` trait surface.
 //!
 //! Backed by a real winit event loop with per-window softbuffer
 //! presentation:
@@ -2349,24 +2349,44 @@ fn cookie_header_value(cookies: &[Cookie<'static>], host: &str) -> Option<String
 }
 
 fn merge_cookies(jar: &mut Vec<Cookie<'static>>, new_cookies: Vec<Cookie<'static>>) {
-    // Replace-by-name semantics: an inbound `Set-Cookie` for the same
-    // name evicts the existing entry, mirroring how
-    // `AddWebviewCookie` already behaves.  v3.2: an inbound cookie
-    // whose `Expires` is already in the past is dropped without
-    // entering the jar (so it can't get sent on the next outbound
-    // request).  `for_each` over an iterator (rather than a `for`
-    // loop) keeps the combinator style; the lint that prefers `for`
-    // is overridden here.
+    // Replace-by-name semantics: an inbound `Set-Cookie` for the
+    // same name evicts the existing entry, mirroring how
+    // `AddWebviewCookie` already behaves.  v3.2 dropped already-
+    // expired entries before they could enter the jar; v3.3 first
+    // rewrites `Max-Age` as an absolute `Expires` (per RFC 6265
+    // Max-Age wins over Expires when both are set) so the expiry
+    // filter catches Max-Age-set cookies too.
     let now = cookie::time::OffsetDateTime::now_utc();
     #[allow(clippy::needless_for_each)]
     new_cookies
         .into_iter()
+        .map(|cookie| apply_max_age_as_expires(cookie, now))
         .filter(|cookie| !cookie_is_expired(cookie, now))
         .for_each(|cookie| {
             let name = cookie.name().to_owned();
             jar.retain(|existing| existing.name() != name.as_str());
             jar.push(cookie);
         });
+}
+
+fn apply_max_age_as_expires(
+    cookie: Cookie<'static>,
+    now: cookie::time::OffsetDateTime,
+) -> Cookie<'static> {
+    let max_age = cookie.max_age();
+    // FFI carve-out: `cookie::Cookie::set_expires` takes `&mut self`,
+    // and `Cookie::build` doesn't expose a "rewrite expires" builder
+    // method.  We own this cookie and rebind it as `mut` only to
+    // convert `Max-Age` (a relative duration) into an absolute
+    // `Expires` instant so the v3.2 expiry filter can act on it.
+    let mut cookie = cookie;
+    // `for_each` over `Option::into_iter()` keeps the combinator
+    // shape; `for` over a 0-or-1-element iter would be marginal.
+    #[allow(clippy::needless_for_each)]
+    max_age.into_iter().for_each(|duration| {
+        cookie.set_expires(now + duration);
+    });
+    cookie
 }
 
 fn cookie_is_expired(cookie: &Cookie<'_>, now: cookie::time::OffsetDateTime) -> bool {
@@ -3656,5 +3676,67 @@ mod tests {
         (!cookie_is_expired(&session, now))
             .then_some(())
             .ok_or_else(|| fail("session cookie wrongly treated as expired"))
+    }
+
+    #[test]
+    fn max_age_zero_expires_immediately() -> Result<(), tauri_runtime::Error> {
+        let mut jar: Vec<Cookie<'static>> = Vec::new();
+        let incoming = vec![
+            Cookie::build(("zero", "v"))
+                .max_age(Duration::seconds(0))
+                .build(),
+        ];
+        merge_cookies(&mut jar, incoming);
+        jar.is_empty()
+            .then_some(())
+            .ok_or_else(|| fail("Max-Age=0 should expire immediately"))
+    }
+
+    #[test]
+    fn max_age_negative_expires_immediately() -> Result<(), tauri_runtime::Error> {
+        let mut jar: Vec<Cookie<'static>> = Vec::new();
+        let incoming = vec![
+            Cookie::build(("neg", "v"))
+                .max_age(Duration::seconds(-100))
+                .build(),
+        ];
+        merge_cookies(&mut jar, incoming);
+        jar.is_empty()
+            .then_some(())
+            .ok_or_else(|| fail("negative Max-Age should expire immediately"))
+    }
+
+    #[test]
+    fn max_age_positive_keeps_cookie() -> Result<(), tauri_runtime::Error> {
+        let mut jar: Vec<Cookie<'static>> = Vec::new();
+        let incoming = vec![
+            Cookie::build(("hour", "v"))
+                .max_age(Duration::seconds(3600))
+                .build(),
+        ];
+        merge_cookies(&mut jar, incoming);
+        let first = jar.first().ok_or_else(|| fail("empty jar"))?;
+        (jar.len() == 1 && first.expires().is_some())
+            .then_some(())
+            .ok_or_else(|| fail("Max-Age>0 should land in jar with Expires set"))
+    }
+
+    #[test]
+    fn max_age_overrides_expires() -> Result<(), tauri_runtime::Error> {
+        // Per RFC 6265: when both Max-Age and Expires are set, Max-Age
+        // takes precedence.  A cookie with future Expires but
+        // Max-Age=-1 should be dropped.
+        let future = OffsetDateTime::now_utc() + Duration::days(1);
+        let mut jar: Vec<Cookie<'static>> = Vec::new();
+        let incoming = vec![
+            Cookie::build(("conflict", "v"))
+                .expires(future)
+                .max_age(Duration::seconds(-1))
+                .build(),
+        ];
+        merge_cookies(&mut jar, incoming);
+        jar.is_empty()
+            .then_some(())
+            .ok_or_else(|| fail("Max-Age should override Expires per RFC 6265"))
     }
 }

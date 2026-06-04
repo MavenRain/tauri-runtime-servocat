@@ -1,8 +1,8 @@
 [package]
 name = "tauri-runtime-servocat"
-version = "3.2.0"
+version = "3.3.0"
 edition = "2024"
-description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.2.0 honours the cookie jar's `Expires` attribute: expired entries are dropped at `Set-Cookie` parse time (so an already-expired response cookie never lands in the jar) and filtered out of the outbound `Cookie:` header (so an entry that aged past its expiry between requests stops being sent).  Session cookies (no `Expires`) and unexpired `DateTime` cookies pass through unchanged.  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
+description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.3.0 honours `Max-Age` by rewriting it as an absolute `Expires` at merge time (so the v3.2 expiry filter catches it without needing a separate receipt-time field).  Per RFC 6265 `Max-Age` wins over any pre-existing `Expires`; `Max-Age=0` or negative values expire the cookie immediately.  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
 license = "MIT OR Apache-2.0"
 keywords = ["tauri", "runtime", "browser", "servo", "type-driven"]
 categories = ["gui", "rendering"]
