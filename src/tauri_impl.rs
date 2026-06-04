@@ -1,4 +1,4 @@
-//! v1.10 implementation of the `tauri_runtime::Runtime` trait surface.
+//! v2.0 implementation of the `tauri_runtime::Runtime` trait surface.
 //!
 //! Backed by a real winit event loop with per-window softbuffer
 //! presentation:
@@ -2279,11 +2279,14 @@ fn with_ipc_dispatch<T: UserEvent, R>(
 /// `data:text/html,<percent-encoded body>`, `file:///...`, and
 /// `http://...` (via net-cat; runs synchronously on the event-loop
 /// thread, so prefer it from `eval_script` only when latency is OK).
-/// Falls back to a placeholder body for unsupported schemes.
-fn html_from_url(url: &str) -> String {
+/// v2.0 attaches the webview's cookie jar (matching the URL's host)
+/// as a single `Cookie: name=value; ...` header when fetching
+/// `http://...`.  Falls back to a placeholder body for unsupported
+/// schemes.
+fn html_from_url(url: &str, cookies: &[Cookie<'static>]) -> String {
     try_data_url(url)
         .or_else(|| try_file_url(url))
-        .or_else(|| try_http_url(url))
+        .or_else(|| try_http_url(url, cookies))
         .unwrap_or_else(|| {
             format!(
                 "<html><body><h1>tauri-runtime-servocat</h1>\
@@ -2310,13 +2313,26 @@ fn try_file_url(url: &str) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
-fn try_http_url(url: &str) -> Option<String> {
+fn try_http_url(url: &str, cookies: &[Cookie<'static>]) -> Option<String> {
     let parsed = url::Url::parse(url).ok()?;
     (parsed.scheme() == "http").then_some(())?;
+    let host = parsed.host_str().unwrap_or("");
     let net_url = net_cat::url::Url::parse(url).ok()?;
     let request = net_cat::request::Request::new(net_cat::method::Method::Get, net_url);
-    let response = net_cat::fetch(&request).ok()?;
+    let request_with_cookies = cookie_header_value(cookies, host)
+        .into_iter()
+        .fold(request, |req, header| req.with_header("Cookie", header));
+    let response = net_cat::fetch(&request_with_cookies).ok()?;
     Some(response.body_text())
+}
+
+fn cookie_header_value(cookies: &[Cookie<'static>], host: &str) -> Option<String> {
+    let serialized: Vec<String> = cookies
+        .iter()
+        .filter(|cookie| cookie.domain().is_none_or(|domain| domain == host))
+        .map(|cookie| format!("{}={}", cookie.name(), cookie.value()))
+        .collect();
+    (!serialized.is_empty()).then(|| serialized.join("; "))
 }
 
 fn print_to_png(
@@ -2489,38 +2505,54 @@ fn present_webview<T: UserEvent>(window: &Window, webview: &mut WebviewState<T>)
     let height = NonZeroU32::new(size.height)?;
     let frame = webview.current_frame.as_ref()?;
     let pixels = render_to_pixels_with(frame, size.width, size.height, &mut webview.text_renderer);
+    // v2.0 visual application of `WebviewDispatch::set_background_color`:
+    // composite the rasterized page over the tracked background colour
+    // instead of always over white.
+    let background = webview
+        .background_color
+        .map_or((255_u8, 255_u8, 255_u8), |color| {
+            (color.0, color.1, color.2)
+        });
     let context = Context::new(window).ok()?;
     // FFI carve-out: softbuffer's `Surface` / `Buffer` require `&mut`
     // for `resize`, `buffer_mut`, and `present`.
     let mut surface = Surface::new(&context, window).ok()?;
     surface.resize(width, height).ok()?;
     let mut buffer = surface.buffer_mut().ok()?;
-    write_pixels(&pixels, &mut buffer);
+    write_pixels(&pixels, background, &mut buffer);
     buffer.present().ok()?;
     Some(())
 }
 
-fn write_pixels(pixels: &PixelBuffer, buffer: &mut softbuffer::Buffer<'_, &Window, &Window>) {
+fn write_pixels(
+    pixels: &PixelBuffer,
+    background: (u8, u8, u8),
+    buffer: &mut softbuffer::Buffer<'_, &Window, &Window>,
+) {
     pixels
         .rgba()
         .chunks_exact(4)
-        .map(rgba_to_softbuffer_word)
+        .map(|chunk| rgba_to_softbuffer_word(chunk, background))
         .zip(buffer.iter_mut())
         .for_each(|(word, slot)| *slot = word);
 }
 
-fn rgba_to_softbuffer_word(chunk: &[u8]) -> u32 {
+fn rgba_to_softbuffer_word(chunk: &[u8], background: (u8, u8, u8)) -> u32 {
     let red = chunk.first().copied().unwrap_or(0);
     let green = chunk.get(1).copied().unwrap_or(0);
     let blue = chunk.get(2).copied().unwrap_or(0);
     let alpha = chunk.get(3).copied().unwrap_or(0);
-    // Composite premultiplied RGBA over a solid white background:
-    //   out = src + (1 - src_a) * dst  with dst = (1,1,1)
-    let inv = 255_u8 - alpha;
-    let out_r = red.saturating_add(inv);
-    let out_g = green.saturating_add(inv);
-    let out_b = blue.saturating_add(inv);
-    (u32::from(out_r) << 16) | (u32::from(out_g) << 8) | u32::from(out_b)
+    let (bg_r, bg_g, bg_b) = background;
+    // Composite premultiplied RGBA over the webview's tracked
+    // background colour:
+    //   out = src + ((1 - src_a / 255) * bg)
+    // Both inputs in [0, 255]; the inverse-alpha multiplication is
+    // done in u32 to avoid premature truncation, then we scale back.
+    let inv = u32::from(255_u8 - alpha);
+    let out_r = (u32::from(red) + (u32::from(bg_r) * inv) / 255).min(255);
+    let out_g = (u32::from(green) + (u32::from(bg_g) * inv) / 255).min(255);
+    let out_b = (u32::from(blue) + (u32::from(bg_b) * inv) / 255).min(255);
+    (out_r << 16) | (out_g << 8) | out_b
 }
 
 impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEvent<T>>
@@ -2681,7 +2713,10 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                         Viewport::new(size.width, size.height)
                     },
                 );
-                let html = html_from_url(&url);
+                // CreateWebview's webview state has no cookies yet,
+                // so we can't attach any.  Future versions could
+                // accept seeded cookies via `PendingWebview`.
+                let html = html_from_url(&url, &[]);
                 let mut state = WebviewState::new(label, html, viewport, ipc_handler);
                 state.rebuild_frame();
                 let _ = self.webviews.insert(webview_raw, state);
@@ -2750,7 +2785,12 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
             }
             RuntimeEvent::Navigate { webview_id, url } => {
                 let webview_raw = webview_id.raw();
-                let html = html_from_url(&url);
+                let cookies = self
+                    .webviews
+                    .get(&webview_raw)
+                    .map(|webview| webview.cookies.clone())
+                    .unwrap_or_default();
+                let html = html_from_url(&url, &cookies);
                 let _ = self.webviews.get_mut(&webview_raw).map(|webview| {
                     webview.html = html;
                     webview.rebuild_frame();

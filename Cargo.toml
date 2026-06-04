@@ -1,8 +1,8 @@
 [package]
 name = "tauri-runtime-servocat"
-version = "1.10.0"
+version = "2.0.0"
 edition = "2024"
-description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v1.10.0 implements `WebviewDispatch::reparent` by introducing a stable `WebviewId` separate from the parent window id; webview-targeted events carry the webview's id and the handler looks up the current parent window via a `webview_to_window` map, so dispatchers survive a reparent and continue addressing the same webview at its new window.  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
+description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v2.0.0 visually applies the webview's tracked `background_color` (the softbuffer compositor now blends over the chosen colour instead of always white) and attaches the webview's cookie jar to net-cat HTTP requests during `navigate(http://...)` (as a single `Cookie: name=value; ...` header).  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
 license = "MIT OR Apache-2.0"
 keywords = ["tauri", "runtime", "browser", "servo", "type-driven"]
 categories = ["gui", "rendering"]
