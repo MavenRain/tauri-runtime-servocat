@@ -57,7 +57,7 @@ pub use raster::{PixelBuffer, render_to_pixels, render_to_pixels_with};
 pub use script::{DEFAULT_FUEL, run_script, run_script_with_backprop, run_script_with_commands};
 pub use tauri_impl::{
     ServocatEventLoopProxy, ServocatHandle, ServocatRuntime, ServocatWebviewDispatch,
-    ServocatWindowBuilder, ServocatWindowDispatch,
+    ServocatWindowBuilder, ServocatWindowDispatch, WebviewId,
 };
 pub use text::TextRenderer;
 pub use window::run_window;

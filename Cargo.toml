@@ -1,8 +1,8 @@
 [package]
 name = "tauri-runtime-servocat"
-version = "1.9.0"
+version = "1.10.0"
 edition = "2024"
-description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v1.9.0 implements `WebviewDispatch::print` (rasterizes the current frame to a PNG in the OS temp directory via tiny-skia's encoder) and makes `with_webview` succeed by invoking the user callback with a unit value (no native webview handle is available, but the closure can still run host-side bookkeeping).  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
+description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v1.10.0 implements `WebviewDispatch::reparent` by introducing a stable `WebviewId` separate from the parent window id; webview-targeted events carry the webview's id and the handler looks up the current parent window via a `webview_to_window` map, so dispatchers survive a reparent and continue addressing the same webview at its new window.  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
 license = "MIT OR Apache-2.0"
 keywords = ["tauri", "runtime", "browser", "servo", "type-driven"]
 categories = ["gui", "rendering"]

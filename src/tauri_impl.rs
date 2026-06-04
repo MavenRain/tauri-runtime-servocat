@@ -1,4 +1,4 @@
-//! v1.9 implementation of the `tauri_runtime::Runtime` trait surface.
+//! v1.10 implementation of the `tauri_runtime::Runtime` trait surface.
 //!
 //! Backed by a real winit event loop with per-window softbuffer
 //! presentation:
@@ -106,9 +106,14 @@ use crate::text::TextRenderer;
 use layout_cat::Viewport;
 
 static NEXT_WINDOW_ID: AtomicU32 = AtomicU32::new(1);
+static NEXT_WEBVIEW_ID: AtomicU32 = AtomicU32::new(1);
 
 fn allocate_window_id() -> WindowId {
     WindowId::from(NEXT_WINDOW_ID.fetch_add(1, Ordering::SeqCst))
+}
+
+fn allocate_webview_id() -> WebviewId {
+    WebviewId(NEXT_WEBVIEW_ID.fetch_add(1, Ordering::SeqCst))
 }
 
 fn raw_window_id(id: WindowId) -> u32 {
@@ -121,6 +126,19 @@ fn raw_window_id(id: WindowId) -> u32 {
         .trim_end_matches(')')
         .parse::<u32>()
         .unwrap_or(0)
+}
+
+/// Stable identifier for a webview owned by a [`ServocatRuntime`].
+/// Distinct from [`WindowId`] so that
+/// [`WebviewDispatch::reparent`] can move a webview between windows
+/// without invalidating an existing dispatcher.
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Ord, PartialOrd)]
+pub struct WebviewId(u32);
+
+impl WebviewId {
+    fn raw(self) -> u32 {
+        self.0
+    }
 }
 
 /// Cross-thread message sent through the winit `EventLoopProxy` to
@@ -175,36 +193,53 @@ pub enum RuntimeEvent<T: UserEvent> {
     /// build the cat-stack pipeline, and present the resulting frame
     /// into the window via softbuffer.  The optional `ipc_handler` is
     /// stored alongside the webview so [`ServocatWebviewDispatch::send_ipc`]
-    /// (and, in a later release, a `__TAURI_INTERNALS__.postMessage`
-    /// JS bridge) can fire the host's `invoke_handler`.
+    /// (and the JS-side `__TAURI__.post_ipc_message` shim) can fire
+    /// the host's `invoke_handler`.
     CreateWebview {
         window_id: WindowId,
+        webview_id: WebviewId,
         label: String,
         url: String,
         ipc_handler: Option<WebviewIpcHandler<T, ServocatRuntime<T>>>,
     },
+    /// Re-attaches an existing webview to a different window.
+    /// Updates the `webview_to_window` / `window_to_webview` maps;
+    /// the dispatcher continues to address this webview.
+    ReparentWebview {
+        webview_id: WebviewId,
+        new_window_id: WindowId,
+    },
     /// Synthesizes a webview->host IPC request, invoking the
     /// `ipc_handler` registered when the webview was created.
     IpcRequest {
-        window_id: WindowId,
+        webview_id: WebviewId,
         request: http::Request<String>,
     },
-    /// Navigates the webview attached to a window to a new URL.  The
-    /// runtime re-builds the pipeline against the new content and
-    /// requests a redraw.
-    Navigate { window_id: WindowId, url: String },
-    /// Reloads the webview attached to a window (re-builds the
-    /// pipeline against the cached HTML/CSS and requests a redraw).
-    Reload { window_id: WindowId },
-    /// Runs a JS expression against the webview attached to a window
-    /// via `run_script_with_backprop`, back-propagates DOM mutations
-    /// into layout, and requests a redraw.
-    EvalScript { window_id: WindowId, script: String },
+    /// Navigates the webview to a new URL.  The runtime re-builds the
+    /// pipeline against the new content and requests a redraw on the
+    /// webview's parent window.
+    Navigate { webview_id: WebviewId, url: String },
+    /// Reloads the webview (re-builds the pipeline against the cached
+    /// HTML/CSS and requests a redraw).
+    Reload { webview_id: WebviewId },
+    /// Runs a JS expression against the webview via
+    /// `run_script_with_backprop`, back-propagates DOM mutations into
+    /// layout, and requests a redraw.
+    EvalScript {
+        webview_id: WebviewId,
+        script: String,
+    },
     /// Like [`Self::EvalScript`] but also delivers a string-formatted
     /// representation of the script's return value back through the
     /// supplied callback after the eval completes.
+    ///
+    /// FFI carve-out: `Box<dyn Fn(String)>` is unavoidable here.
+    /// `winit::EventLoop<RuntimeEvent<T>>` is parameterized on a
+    /// concrete enum, so a closure with arbitrary captures (which is
+    /// what the `WebviewDispatch::eval_script_with_callback` trait
+    /// method accepts) must be type-erased to fit in a variant.
     EvalScriptWithCallback {
-        window_id: WindowId,
+        webview_id: WebviewId,
         script: String,
         callback: Box<dyn Fn(String) + Send + 'static>,
     },
@@ -299,6 +334,15 @@ pub enum RuntimeEvent<T: UserEvent> {
     },
     /// Run an arbitrary closure on the main thread (where the event
     /// loop is dispatched).
+    ///
+    /// FFI carve-out: `Box<dyn FnOnce()>` is unavoidable.  The trait
+    /// methods `RuntimeHandle::run_on_main_thread` /
+    /// `WindowDispatch::run_on_main_thread` /
+    /// `WebviewDispatch::run_on_main_thread` accept a generic
+    /// `F: FnOnce() + Send + 'static`; since
+    /// `winit::EventLoop<RuntimeEvent<T>>` is a concrete enum the
+    /// closure with arbitrary captures must be type-erased to ship
+    /// through the proxy.
     RunOnMainThread {
         thunk: Box<dyn FnOnce() + Send + 'static>,
     },
@@ -374,60 +418,76 @@ pub enum RuntimeEvent<T: UserEvent> {
         reply: mpsc::Sender<bool>,
     },
     /// Updates the tracked bounds (position + size) of a webview.
-    SetWebviewBounds { id: WindowId, bounds: Rect },
+    SetWebviewBounds { webview_id: WebviewId, bounds: Rect },
     /// Updates the tracked size of a webview (position unchanged).
-    SetWebviewSize { id: WindowId, size: Size },
+    SetWebviewSize { webview_id: WebviewId, size: Size },
     /// Updates the tracked position of a webview (size unchanged).
-    SetWebviewPosition { id: WindowId, position: Position },
+    SetWebviewPosition {
+        webview_id: WebviewId,
+        position: Position,
+    },
     /// Asks the handler for the tracked bounds of a webview.
     QueryWebviewBounds {
-        id: WindowId,
+        webview_id: WebviewId,
         reply: mpsc::Sender<Rect>,
     },
     /// Asks the handler for the tracked position of a webview.
     QueryWebviewPosition {
-        id: WindowId,
+        webview_id: WebviewId,
         reply: mpsc::Sender<PhysicalPosition<i32>>,
     },
     /// Asks the handler for the tracked size of a webview.
     QueryWebviewSize {
-        id: WindowId,
+        webview_id: WebviewId,
         reply: mpsc::Sender<PhysicalSize<u32>>,
     },
     /// Updates the tracked zoom factor of a webview.
-    SetWebviewZoom { id: WindowId, scale: f64 },
+    SetWebviewZoom { webview_id: WebviewId, scale: f64 },
     /// Updates the tracked background color of a webview.
-    SetWebviewBackgroundColor { id: WindowId, color: Option<Color> },
+    SetWebviewBackgroundColor {
+        webview_id: WebviewId,
+        color: Option<Color>,
+    },
     /// Updates the tracked auto-resize flag of a webview.
-    SetWebviewAutoResize { id: WindowId, auto_resize: bool },
+    SetWebviewAutoResize {
+        webview_id: WebviewId,
+        auto_resize: bool,
+    },
     /// Appends a cookie to the webview's in-memory cookie jar
     /// (replacing any existing entry with the same name).
     AddWebviewCookie {
-        id: WindowId,
+        webview_id: WebviewId,
         cookie: Cookie<'static>,
     },
     /// Removes a cookie from the webview's in-memory cookie jar.
     RemoveWebviewCookie {
-        id: WindowId,
+        webview_id: WebviewId,
         cookie: Cookie<'static>,
     },
     /// Clears the webview's in-memory cookie jar.
-    ClearWebviewBrowsingData { id: WindowId },
+    ClearWebviewBrowsingData { webview_id: WebviewId },
     /// Asks the handler for the full cookie jar of a webview.
     QueryWebviewCookies {
-        id: WindowId,
+        webview_id: WebviewId,
         reply: mpsc::Sender<Vec<Cookie<'static>>>,
     },
     /// Asks the handler for the cookies in a webview's jar matching
     /// the given URL's host.
     QueryWebviewCookiesForUrl {
-        id: WindowId,
+        webview_id: WebviewId,
         url: Url,
         reply: mpsc::Sender<Vec<Cookie<'static>>>,
     },
     /// Rasterizes the webview's current frame to a PNG and writes it
     /// to the OS temp directory.  Used by [`WebviewDispatch::print`].
-    PrintWebview { id: WindowId },
+    PrintWebview { webview_id: WebviewId },
+    /// Closes the window the given webview is currently attached to.
+    /// Used by [`WebviewDispatch::close`]; the handler resolves the
+    /// parent via `webview_to_window`.
+    CloseWebviewParentWindow { webview_id: WebviewId },
+    /// Focuses the window the given webview is currently attached to.
+    /// Used by [`WebviewDispatch::set_focus`].
+    FocusWebviewParentWindow { webview_id: WebviewId },
     /// Asks the runtime to exit with the given code.
     Exit { code: i32 },
 }
@@ -453,6 +513,7 @@ impl<T: UserEvent> std::fmt::Debug for RuntimeEvent<T> {
             Self::SetDecorations { .. } => "SetDecorations",
             Self::SetFullscreen { .. } => "SetFullscreen",
             Self::CreateWebview { .. } => "CreateWebview",
+            Self::ReparentWebview { .. } => "ReparentWebview",
             Self::IpcRequest { .. } => "IpcRequest",
             Self::Navigate { .. } => "Navigate",
             Self::Reload { .. } => "Reload",
@@ -516,6 +577,8 @@ impl<T: UserEvent> std::fmt::Debug for RuntimeEvent<T> {
             Self::QueryWebviewCookies { .. } => "QueryWebviewCookies",
             Self::QueryWebviewCookiesForUrl { .. } => "QueryWebviewCookiesForUrl",
             Self::PrintWebview { .. } => "PrintWebview",
+            Self::CloseWebviewParentWindow { .. } => "CloseWebviewParentWindow",
+            Self::FocusWebviewParentWindow { .. } => "FocusWebviewParentWindow",
             Self::Exit { .. } => "Exit",
         };
         formatter.write_str(name)
@@ -587,11 +650,14 @@ impl<T: UserEvent> Clone for ServocatWindowDispatch<T> {
     }
 }
 
-/// `Send`-able dispatcher for [`ServocatRuntime`] webviews.  Still
-/// stub-shaped in v1.1; carries the parent window id for routing.
+/// `Send`-able dispatcher for [`ServocatRuntime`] webviews.  Holds
+/// a stable [`WebviewId`] that survives a `reparent(new_window_id)`
+/// call -- the handler maintains a `webview_to_window` map so all
+/// events on this dispatcher continue to address the same webview at
+/// its current parent window.
 pub struct ServocatWebviewDispatch<T: UserEvent> {
     proxy: EventLoopProxy<RuntimeEvent<T>>,
-    window_id: WindowId,
+    webview_id: WebviewId,
     _marker: PhantomData<fn() -> T>,
 }
 
@@ -599,7 +665,7 @@ impl<T: UserEvent> std::fmt::Debug for ServocatWebviewDispatch<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ServocatWebviewDispatch")
-            .field("window_id", &self.window_id)
+            .field("webview_id", &self.webview_id)
             .finish_non_exhaustive()
     }
 }
@@ -608,7 +674,7 @@ impl<T: UserEvent> Clone for ServocatWebviewDispatch<T> {
     fn clone(&self) -> Self {
         Self {
             proxy: self.proxy.clone(),
-            window_id: self.window_id,
+            webview_id: self.webview_id,
             _marker: PhantomData,
         }
     }
@@ -632,7 +698,7 @@ impl<T: UserEvent> ServocatWebviewDispatch<T> {
     pub fn send_ipc(&self, request: http::Request<String>) -> Result<()> {
         self.proxy
             .send_event(RuntimeEvent::IpcRequest {
-                window_id: self.window_id,
+                webview_id: self.webview_id,
                 request,
             })
             .map_err(|_e| Error::EventLoopClosed)
@@ -1713,12 +1779,15 @@ impl<T: UserEvent> WebviewDispatch<T> for ServocatWebviewDispatch<T> {
     }
 
     fn with_webview<F: FnOnce(Box<dyn std::any::Any>) + Send + 'static>(&self, f: F) -> Result<()> {
-        // No native webview handle exists in the cat-stack runtime, so
-        // the closure can't introspect a platform webview; we still
-        // ship it to the main thread with `Box::new(())` so callers
-        // that use `with_webview` purely to schedule a host-side
-        // closure on the main thread (a common Tauri pattern) get the
-        // synchronous-dispatch behaviour they expect.
+        // FFI carve-out: `Box<dyn std::any::Any>` is the parameter
+        // shape the `tauri_runtime::WebviewDispatch::with_webview`
+        // trait method requires.  No native webview handle exists in
+        // the cat-stack runtime, so the closure can't introspect a
+        // platform webview; we still ship it to the main thread with
+        // `Box::new(())` so callers that use `with_webview` purely
+        // to schedule a host-side closure on the main thread (a
+        // common Tauri pattern) get the synchronous-dispatch
+        // behaviour they expect.
         let thunk: Box<dyn FnOnce() + Send + 'static> = Box::new(move || {
             f(Box::new(()));
         });
@@ -1744,21 +1813,21 @@ impl<T: UserEvent> WebviewDispatch<T> for ServocatWebviewDispatch<T> {
 
     fn bounds(&self) -> Result<Rect> {
         query(&self.proxy, |reply| RuntimeEvent::QueryWebviewBounds {
-            id: self.window_id,
+            webview_id: self.webview_id,
             reply,
         })
     }
 
     fn position(&self) -> Result<PhysicalPosition<i32>> {
         query(&self.proxy, |reply| RuntimeEvent::QueryWebviewPosition {
-            id: self.window_id,
+            webview_id: self.webview_id,
             reply,
         })
     }
 
     fn size(&self) -> Result<PhysicalSize<u32>> {
         query(&self.proxy, |reply| RuntimeEvent::QueryWebviewSize {
-            id: self.window_id,
+            webview_id: self.webview_id,
             reply,
         })
     }
@@ -1766,7 +1835,7 @@ impl<T: UserEvent> WebviewDispatch<T> for ServocatWebviewDispatch<T> {
     fn navigate(&self, url: Url) -> Result<()> {
         self.proxy
             .send_event(RuntimeEvent::Navigate {
-                window_id: self.window_id,
+                webview_id: self.webview_id,
                 url: url.into(),
             })
             .map_err(|_e| Error::EventLoopClosed)
@@ -1775,27 +1844,31 @@ impl<T: UserEvent> WebviewDispatch<T> for ServocatWebviewDispatch<T> {
     fn reload(&self) -> Result<()> {
         self.proxy
             .send_event(RuntimeEvent::Reload {
-                window_id: self.window_id,
+                webview_id: self.webview_id,
             })
             .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn print(&self) -> Result<()> {
         self.proxy
-            .send_event(RuntimeEvent::PrintWebview { id: self.window_id })
+            .send_event(RuntimeEvent::PrintWebview {
+                webview_id: self.webview_id,
+            })
             .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn close(&self) -> Result<()> {
         self.proxy
-            .send_event(RuntimeEvent::Close { id: self.window_id })
+            .send_event(RuntimeEvent::CloseWebviewParentWindow {
+                webview_id: self.webview_id,
+            })
             .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn set_bounds(&self, bounds: Rect) -> Result<()> {
         self.proxy
             .send_event(RuntimeEvent::SetWebviewBounds {
-                id: self.window_id,
+                webview_id: self.webview_id,
                 bounds,
             })
             .map_err(|_e| Error::EventLoopClosed)
@@ -1804,7 +1877,7 @@ impl<T: UserEvent> WebviewDispatch<T> for ServocatWebviewDispatch<T> {
     fn set_size(&self, size: Size) -> Result<()> {
         self.proxy
             .send_event(RuntimeEvent::SetWebviewSize {
-                id: self.window_id,
+                webview_id: self.webview_id,
                 size,
             })
             .map_err(|_e| Error::EventLoopClosed)
@@ -1813,7 +1886,7 @@ impl<T: UserEvent> WebviewDispatch<T> for ServocatWebviewDispatch<T> {
     fn set_position(&self, position: Position) -> Result<()> {
         self.proxy
             .send_event(RuntimeEvent::SetWebviewPosition {
-                id: self.window_id,
+                webview_id: self.webview_id,
                 position,
             })
             .map_err(|_e| Error::EventLoopClosed)
@@ -1821,7 +1894,9 @@ impl<T: UserEvent> WebviewDispatch<T> for ServocatWebviewDispatch<T> {
 
     fn set_focus(&self) -> Result<()> {
         self.proxy
-            .send_event(RuntimeEvent::Focus { id: self.window_id })
+            .send_event(RuntimeEvent::FocusWebviewParentWindow {
+                webview_id: self.webview_id,
+            })
             .map_err(|_e| Error::EventLoopClosed)
     }
 
@@ -1836,7 +1911,7 @@ impl<T: UserEvent> WebviewDispatch<T> for ServocatWebviewDispatch<T> {
     fn eval_script<S: Into<String>>(&self, script: S) -> Result<()> {
         self.proxy
             .send_event(RuntimeEvent::EvalScript {
-                window_id: self.window_id,
+                webview_id: self.webview_id,
                 script: script.into(),
             })
             .map_err(|_e| Error::EventLoopClosed)
@@ -1847,23 +1922,33 @@ impl<T: UserEvent> WebviewDispatch<T> for ServocatWebviewDispatch<T> {
         script: S,
         callback: impl Fn(String) + Send + 'static,
     ) -> Result<()> {
+        // FFI carve-out: storing user closures in a `RuntimeEvent`
+        // variant requires `Box<dyn Fn(String) + Send + 'static>`
+        // because `winit::EventLoop<RuntimeEvent<T>>` is parameterized
+        // on a concrete enum -- closures with arbitrary captures can't
+        // be encoded in a per-variant generic.
         self.proxy
             .send_event(RuntimeEvent::EvalScriptWithCallback {
-                window_id: self.window_id,
+                webview_id: self.webview_id,
                 script: script.into(),
                 callback: Box::new(callback),
             })
             .map_err(|_e| Error::EventLoopClosed)
     }
 
-    fn reparent(&self, _window_id: WindowId) -> Result<()> {
-        Err(Error::WindowNotFound)
+    fn reparent(&self, window_id: WindowId) -> Result<()> {
+        self.proxy
+            .send_event(RuntimeEvent::ReparentWebview {
+                webview_id: self.webview_id,
+                new_window_id: window_id,
+            })
+            .map_err(|_e| Error::EventLoopClosed)
     }
 
     fn cookies_for_url(&self, url: Url) -> Result<Vec<Cookie<'static>>> {
         query(&self.proxy, |reply| {
             RuntimeEvent::QueryWebviewCookiesForUrl {
-                id: self.window_id,
+                webview_id: self.webview_id,
                 url,
                 reply,
             }
@@ -1872,7 +1957,7 @@ impl<T: UserEvent> WebviewDispatch<T> for ServocatWebviewDispatch<T> {
 
     fn cookies(&self) -> Result<Vec<Cookie<'static>>> {
         query(&self.proxy, |reply| RuntimeEvent::QueryWebviewCookies {
-            id: self.window_id,
+            webview_id: self.webview_id,
             reply,
         })
     }
@@ -1880,7 +1965,7 @@ impl<T: UserEvent> WebviewDispatch<T> for ServocatWebviewDispatch<T> {
     fn set_cookie(&self, cookie: Cookie<'_>) -> Result<()> {
         self.proxy
             .send_event(RuntimeEvent::AddWebviewCookie {
-                id: self.window_id,
+                webview_id: self.webview_id,
                 cookie: cookie.into_owned(),
             })
             .map_err(|_e| Error::EventLoopClosed)
@@ -1889,7 +1974,7 @@ impl<T: UserEvent> WebviewDispatch<T> for ServocatWebviewDispatch<T> {
     fn delete_cookie(&self, cookie: Cookie<'_>) -> Result<()> {
         self.proxy
             .send_event(RuntimeEvent::RemoveWebviewCookie {
-                id: self.window_id,
+                webview_id: self.webview_id,
                 cookie: cookie.into_owned(),
             })
             .map_err(|_e| Error::EventLoopClosed)
@@ -1898,7 +1983,7 @@ impl<T: UserEvent> WebviewDispatch<T> for ServocatWebviewDispatch<T> {
     fn set_auto_resize(&self, auto_resize: bool) -> Result<()> {
         self.proxy
             .send_event(RuntimeEvent::SetWebviewAutoResize {
-                id: self.window_id,
+                webview_id: self.webview_id,
                 auto_resize,
             })
             .map_err(|_e| Error::EventLoopClosed)
@@ -1907,7 +1992,7 @@ impl<T: UserEvent> WebviewDispatch<T> for ServocatWebviewDispatch<T> {
     fn set_zoom(&self, scale_factor: f64) -> Result<()> {
         self.proxy
             .send_event(RuntimeEvent::SetWebviewZoom {
-                id: self.window_id,
+                webview_id: self.webview_id,
                 scale: scale_factor,
             })
             .map_err(|_e| Error::EventLoopClosed)
@@ -1916,7 +2001,7 @@ impl<T: UserEvent> WebviewDispatch<T> for ServocatWebviewDispatch<T> {
     fn set_background_color(&self, color: Option<Color>) -> Result<()> {
         self.proxy
             .send_event(RuntimeEvent::SetWebviewBackgroundColor {
-                id: self.window_id,
+                webview_id: self.webview_id,
                 color,
             })
             .map_err(|_e| Error::EventLoopClosed)
@@ -1924,7 +2009,9 @@ impl<T: UserEvent> WebviewDispatch<T> for ServocatWebviewDispatch<T> {
 
     fn clear_all_browsing_data(&self) -> Result<()> {
         self.proxy
-            .send_event(RuntimeEvent::ClearWebviewBrowsingData { id: self.window_id })
+            .send_event(RuntimeEvent::ClearWebviewBrowsingData {
+                webview_id: self.webview_id,
+            })
             .map_err(|_e| Error::EventLoopClosed)
     }
 }
@@ -1978,9 +2065,11 @@ fn queue_webview<T: UserEvent>(
     pending: PendingWebview<T, ServocatRuntime<T>>,
 ) -> Result<DetachedWebview<T, ServocatRuntime<T>>> {
     let label = pending.label;
+    let webview_id = allocate_webview_id();
     proxy
         .send_event(RuntimeEvent::CreateWebview {
             window_id,
+            webview_id,
             label: label.clone(),
             url: pending.url,
             ipc_handler: pending.ipc_handler,
@@ -1990,7 +2079,7 @@ fn queue_webview<T: UserEvent>(
         label,
         dispatcher: ServocatWebviewDispatch {
             proxy: proxy.clone(),
-            window_id,
+            webview_id,
             _marker: PhantomData,
         },
     })
@@ -2005,13 +2094,13 @@ trait IpcDispatch {
 
 struct IpcDispatchImpl<T: UserEvent> {
     proxy: EventLoopProxy<RuntimeEvent<T>>,
-    window_id: WindowId,
+    webview_id: WebviewId,
 }
 
 impl<T: UserEvent> IpcDispatch for IpcDispatchImpl<T> {
     fn dispatch(&self, request: http::Request<String>) {
         let _ = self.proxy.send_event(RuntimeEvent::IpcRequest {
-            window_id: self.window_id,
+            webview_id: self.webview_id,
             request,
         });
     }
@@ -2172,10 +2261,10 @@ impl<T: UserEvent> WebviewState<T> {
 /// `post_ipc_message` shim can reach the right window's `ipc_handler`.
 fn with_ipc_dispatch<T: UserEvent, R>(
     proxy: EventLoopProxy<RuntimeEvent<T>>,
-    window_id: WindowId,
+    webview_id: WebviewId,
     body: impl FnOnce() -> R,
 ) -> R {
-    let dispatcher: Box<dyn IpcDispatch> = Box::new(IpcDispatchImpl { proxy, window_id });
+    let dispatcher: Box<dyn IpcDispatch> = Box::new(IpcDispatchImpl { proxy, webview_id });
     IPC_DISPATCH.with(|slot| {
         let _ = slot.borrow_mut().replace(dispatcher);
     });
@@ -2337,7 +2426,14 @@ struct AppHandler<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> {
     windows: BTreeMap<u32, Window>,
     labels: BTreeMap<u32, String>,
     winit_to_tauri: BTreeMap<WinitWindowId, u32>,
+    /// Webview state keyed by `WebviewId.raw()` so the dispatcher's
+    /// id survives a `reparent(new_window_id)` call.
     webviews: BTreeMap<u32, WebviewState<T>>,
+    /// Maps `WebviewId.raw()` -> current parent `WindowId.raw()`.
+    webview_to_window: BTreeMap<u32, u32>,
+    /// Maps parent `WindowId.raw()` -> attached `WebviewId.raw()`
+    /// (single webview per window in our model).
+    window_to_webview: BTreeMap<u32, u32>,
     flags: BTreeMap<u32, WindowFlags>,
     ready_dispatched: bool,
 }
@@ -2351,6 +2447,8 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> AppHandler<T, F> {
             labels: BTreeMap::new(),
             winit_to_tauri: BTreeMap::new(),
             webviews: BTreeMap::new(),
+            webview_to_window: BTreeMap::new(),
+            window_to_webview: BTreeMap::new(),
             flags: BTreeMap::new(),
             ready_dispatched: false,
         }
@@ -2365,9 +2463,20 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> AppHandler<T, F> {
         let _ = self.windows.get(&raw_id).map(Window::request_redraw);
     }
 
-    fn present(&mut self, raw_id: u32) {
-        let window_opt = self.windows.get(&raw_id);
-        let webview_opt = self.webviews.get_mut(&raw_id);
+    fn parent_window_of(&self, webview_raw: u32) -> Option<u32> {
+        self.webview_to_window.get(&webview_raw).copied()
+    }
+
+    fn request_redraw_for_webview(&self, webview_raw: u32) {
+        let _ = self
+            .parent_window_of(webview_raw)
+            .map(|window_raw| self.request_redraw(window_raw));
+    }
+
+    fn present(&mut self, window_raw: u32) {
+        let webview_raw_opt = self.window_to_webview.get(&window_raw).copied();
+        let window_opt = self.windows.get(&window_raw);
+        let webview_opt = webview_raw_opt.and_then(|wv| self.webviews.get_mut(&wv));
         let _ = window_opt
             .zip(webview_opt)
             .and_then(|(window, webview)| present_webview(window, webview));
@@ -2501,6 +2610,11 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                 self.dispatch_window_event(raw, TauriWindowEvent::Destroyed);
                 let _ = self.labels.remove(&raw);
                 let _ = self.flags.remove(&raw);
+                // If a webview was attached to this window, evict it.
+                let _ = self.window_to_webview.remove(&raw).map(|webview_raw| {
+                    let _ = self.webviews.remove(&webview_raw);
+                    let _ = self.webview_to_window.remove(&webview_raw);
+                });
             }
             RuntimeEvent::Maximize { id } => {
                 let raw = raw_window_id(id);
@@ -2553,12 +2667,14 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
             }
             RuntimeEvent::CreateWebview {
                 window_id,
+                webview_id,
                 label,
                 url,
                 ipc_handler,
             } => {
-                let raw = raw_window_id(window_id);
-                let viewport = self.windows.get(&raw).map_or_else(
+                let window_raw = raw_window_id(window_id);
+                let webview_raw = webview_id.raw();
+                let viewport = self.windows.get(&window_raw).map_or_else(
                     || Viewport::new(800, 600),
                     |window| {
                         let size = window.inner_size();
@@ -2568,12 +2684,53 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                 let html = html_from_url(&url);
                 let mut state = WebviewState::new(label, html, viewport, ipc_handler);
                 state.rebuild_frame();
-                let _ = self.webviews.insert(raw, state);
-                self.request_redraw(raw);
+                let _ = self.webviews.insert(webview_raw, state);
+                let _ = self.webview_to_window.insert(webview_raw, window_raw);
+                let _ = self.window_to_webview.insert(window_raw, webview_raw);
+                self.request_redraw(window_raw);
             }
-            RuntimeEvent::IpcRequest { window_id, request } => {
-                let raw = raw_window_id(window_id);
-                let dispatch_pair = self.webviews.get(&raw).and_then(|webview| {
+            RuntimeEvent::ReparentWebview {
+                webview_id,
+                new_window_id,
+            } => {
+                let webview_raw = webview_id.raw();
+                let new_window_raw = raw_window_id(new_window_id);
+                let old_window_raw = self.webview_to_window.get(&webview_raw).copied();
+                let _ = old_window_raw.map(|old| {
+                    if self.window_to_webview.get(&old) == Some(&webview_raw) {
+                        let _ = self.window_to_webview.remove(&old);
+                    }
+                    self.request_redraw(old);
+                });
+                let _ = self.webview_to_window.insert(webview_raw, new_window_raw);
+                let _ = self.window_to_webview.insert(new_window_raw, webview_raw);
+                self.request_redraw(new_window_raw);
+            }
+            RuntimeEvent::CloseWebviewParentWindow { webview_id } => {
+                let _ = self.parent_window_of(webview_id.raw()).map(|window_raw| {
+                    let _ = self.windows.remove(&window_raw).map(|window| {
+                        let winit_id = window.id();
+                        let _ = self.winit_to_tauri.remove(&winit_id);
+                        drop(window);
+                    });
+                    self.dispatch_window_event(window_raw, TauriWindowEvent::Destroyed);
+                    let _ = self.labels.remove(&window_raw);
+                    let _ = self.flags.remove(&window_raw);
+                    let _ = self.window_to_webview.remove(&window_raw);
+                });
+            }
+            RuntimeEvent::FocusWebviewParentWindow { webview_id } => {
+                let _ = self
+                    .parent_window_of(webview_id.raw())
+                    .and_then(|window_raw| self.windows.get(&window_raw))
+                    .map(Window::focus_window);
+            }
+            RuntimeEvent::IpcRequest {
+                webview_id,
+                request,
+            } => {
+                let webview_raw = webview_id.raw();
+                let dispatch_pair = self.webviews.get(&webview_raw).and_then(|webview| {
                     webview
                         .ipc_handler
                         .as_ref()
@@ -2584,53 +2741,56 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                         label,
                         dispatcher: ServocatWebviewDispatch {
                             proxy: self.proxy.clone(),
-                            window_id,
+                            webview_id,
                             _marker: PhantomData,
                         },
                     };
                     handler(detached, request);
                 });
             }
-            RuntimeEvent::Navigate { window_id, url } => {
-                let raw = raw_window_id(window_id);
+            RuntimeEvent::Navigate { webview_id, url } => {
+                let webview_raw = webview_id.raw();
                 let html = html_from_url(&url);
-                let _ = self.webviews.get_mut(&raw).map(|webview| {
+                let _ = self.webviews.get_mut(&webview_raw).map(|webview| {
                     webview.html = html;
                     webview.rebuild_frame();
                 });
-                self.request_redraw(raw);
+                self.request_redraw_for_webview(webview_raw);
             }
-            RuntimeEvent::Reload { window_id } => {
-                let raw = raw_window_id(window_id);
-                let _ = self.webviews.get_mut(&raw).map(WebviewState::rebuild_frame);
-                self.request_redraw(raw);
+            RuntimeEvent::Reload { webview_id } => {
+                let webview_raw = webview_id.raw();
+                let _ = self
+                    .webviews
+                    .get_mut(&webview_raw)
+                    .map(WebviewState::rebuild_frame);
+                self.request_redraw_for_webview(webview_raw);
             }
-            RuntimeEvent::EvalScript { window_id, script } => {
-                let raw = raw_window_id(window_id);
+            RuntimeEvent::EvalScript { webview_id, script } => {
+                let webview_raw = webview_id.raw();
                 let proxy = self.proxy.clone();
-                with_ipc_dispatch(proxy, window_id, || {
+                with_ipc_dispatch(proxy, webview_id, || {
                     let _ = self
                         .webviews
-                        .get_mut(&raw)
+                        .get_mut(&webview_raw)
                         .map(|webview| webview.eval(&script));
                 });
-                self.request_redraw(raw);
+                self.request_redraw_for_webview(webview_raw);
             }
             RuntimeEvent::EvalScriptWithCallback {
-                window_id,
+                webview_id,
                 script,
                 callback,
             } => {
-                let raw = raw_window_id(window_id);
+                let webview_raw = webview_id.raw();
                 let proxy = self.proxy.clone();
-                let result = with_ipc_dispatch(proxy, window_id, || {
+                let result = with_ipc_dispatch(proxy, webview_id, || {
                     self.webviews
-                        .get_mut(&raw)
+                        .get_mut(&webview_raw)
                         .and_then(|webview| webview.eval(&script))
                         .unwrap_or_default()
                 });
                 callback(result);
-                self.request_redraw(raw);
+                self.request_redraw_for_webview(webview_raw);
             }
             RuntimeEvent::QueryInnerSize { id, reply } => {
                 let raw = raw_window_id(id);
@@ -3015,14 +3175,14 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                     .is_some_and(|flags| flags.always_on_top);
                 let _ = reply.send(value);
             }
-            RuntimeEvent::SetWebviewBounds { id, bounds } => {
-                let raw = raw_window_id(id);
+            RuntimeEvent::SetWebviewBounds { webview_id, bounds } => {
+                let raw = webview_id.raw();
                 let _ = self.webviews.get_mut(&raw).map(|webview| {
                     webview.bounds = bounds;
                 });
             }
-            RuntimeEvent::SetWebviewSize { id, size } => {
-                let raw = raw_window_id(id);
+            RuntimeEvent::SetWebviewSize { webview_id, size } => {
+                let raw = webview_id.raw();
                 let _ = self.webviews.get_mut(&raw).map(|webview| {
                     webview.bounds = Rect {
                         position: webview.bounds.position,
@@ -3030,8 +3190,11 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                     };
                 });
             }
-            RuntimeEvent::SetWebviewPosition { id, position } => {
-                let raw = raw_window_id(id);
+            RuntimeEvent::SetWebviewPosition {
+                webview_id,
+                position,
+            } => {
+                let raw = webview_id.raw();
                 let _ = self.webviews.get_mut(&raw).map(|webview| {
                     webview.bounds = Rect {
                         position,
@@ -3039,8 +3202,8 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                     };
                 });
             }
-            RuntimeEvent::QueryWebviewBounds { id, reply } => {
-                let raw = raw_window_id(id);
+            RuntimeEvent::QueryWebviewBounds { webview_id, reply } => {
+                let raw = webview_id.raw();
                 let value = self.webviews.get(&raw).map_or_else(
                     || Rect {
                         position: Position::Physical(PhysicalPosition::new(0, 0)),
@@ -3050,8 +3213,8 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                 );
                 let _ = reply.send(value);
             }
-            RuntimeEvent::QueryWebviewPosition { id, reply } => {
-                let raw = raw_window_id(id);
+            RuntimeEvent::QueryWebviewPosition { webview_id, reply } => {
+                let raw = webview_id.raw();
                 let value = self.webviews.get(&raw).map_or_else(
                     || PhysicalPosition::new(0, 0),
                     |webview| match webview.bounds.position {
@@ -3067,26 +3230,29 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                 );
                 let _ = reply.send(value);
             }
-            RuntimeEvent::SetWebviewZoom { id, scale } => {
-                let raw = raw_window_id(id);
+            RuntimeEvent::SetWebviewZoom { webview_id, scale } => {
+                let raw = webview_id.raw();
                 let _ = self.webviews.get_mut(&raw).map(|webview| {
                     webview.zoom = scale;
                 });
             }
-            RuntimeEvent::SetWebviewBackgroundColor { id, color } => {
-                let raw = raw_window_id(id);
+            RuntimeEvent::SetWebviewBackgroundColor { webview_id, color } => {
+                let raw = webview_id.raw();
                 let _ = self.webviews.get_mut(&raw).map(|webview| {
                     webview.background_color = color;
                 });
             }
-            RuntimeEvent::SetWebviewAutoResize { id, auto_resize } => {
-                let raw = raw_window_id(id);
+            RuntimeEvent::SetWebviewAutoResize {
+                webview_id,
+                auto_resize,
+            } => {
+                let raw = webview_id.raw();
                 let _ = self.webviews.get_mut(&raw).map(|webview| {
                     webview.auto_resize = auto_resize;
                 });
             }
-            RuntimeEvent::AddWebviewCookie { id, cookie } => {
-                let raw = raw_window_id(id);
+            RuntimeEvent::AddWebviewCookie { webview_id, cookie } => {
+                let raw = webview_id.raw();
                 let _ = self.webviews.get_mut(&raw).map(|webview| {
                     let name = cookie.name().to_owned();
                     webview
@@ -3095,8 +3261,8 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                     webview.cookies.push(cookie);
                 });
             }
-            RuntimeEvent::RemoveWebviewCookie { id, cookie } => {
-                let raw = raw_window_id(id);
+            RuntimeEvent::RemoveWebviewCookie { webview_id, cookie } => {
+                let raw = webview_id.raw();
                 let _ = self.webviews.get_mut(&raw).map(|webview| {
                     let name = cookie.name().to_owned();
                     webview
@@ -3104,14 +3270,14 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                         .retain(|existing| existing.name() != name.as_str());
                 });
             }
-            RuntimeEvent::ClearWebviewBrowsingData { id } => {
-                let raw = raw_window_id(id);
+            RuntimeEvent::ClearWebviewBrowsingData { webview_id } => {
+                let raw = webview_id.raw();
                 let _ = self.webviews.get_mut(&raw).map(|webview| {
                     webview.cookies.clear();
                 });
             }
-            RuntimeEvent::QueryWebviewCookies { id, reply } => {
-                let raw = raw_window_id(id);
+            RuntimeEvent::QueryWebviewCookies { webview_id, reply } => {
+                let raw = webview_id.raw();
                 let value = self
                     .webviews
                     .get(&raw)
@@ -3119,14 +3285,14 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                     .unwrap_or_default();
                 let _ = reply.send(value);
             }
-            RuntimeEvent::PrintWebview { id } => {
-                let raw = raw_window_id(id);
-                let size = self
-                    .windows
-                    .get(&raw)
+            RuntimeEvent::PrintWebview { webview_id } => {
+                let webview_raw = webview_id.raw();
+                let window_raw_opt = self.parent_window_of(webview_raw);
+                let size = window_raw_opt
+                    .and_then(|window_raw| self.windows.get(&window_raw))
                     .map(winit::window::Window::inner_size);
                 let _ = size.and_then(|sz| {
-                    self.webviews.get_mut(&raw).and_then(|webview| {
+                    self.webviews.get_mut(&webview_raw).and_then(|webview| {
                         let WebviewState {
                             current_frame,
                             text_renderer,
@@ -3143,8 +3309,12 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                     })
                 });
             }
-            RuntimeEvent::QueryWebviewCookiesForUrl { id, url, reply } => {
-                let raw = raw_window_id(id);
+            RuntimeEvent::QueryWebviewCookiesForUrl {
+                webview_id,
+                url,
+                reply,
+            } => {
+                let raw = webview_id.raw();
                 let host = url.host_str().unwrap_or("").to_owned();
                 let value = self
                     .webviews
@@ -3162,8 +3332,8 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                     .unwrap_or_default();
                 let _ = reply.send(value);
             }
-            RuntimeEvent::QueryWebviewSize { id, reply } => {
-                let raw = raw_window_id(id);
+            RuntimeEvent::QueryWebviewSize { webview_id, reply } => {
+                let raw = webview_id.raw();
                 let value = self.webviews.get(&raw).map_or_else(
                     || PhysicalSize::new(0, 0),
                     |webview| match webview.bounds.size {
@@ -3230,17 +3400,20 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                         raw,
                         TauriWindowEvent::Resized(PhysicalSize::new(size.width, size.height)),
                     );
-                    let _ = self.webviews.get_mut(&raw).map(|webview| {
-                        if webview.auto_resize {
-                            webview.bounds = Rect {
-                                position: Position::Physical(PhysicalPosition::new(0, 0)),
-                                size: tauri_runtime::dpi::Size::Physical(PhysicalSize::new(
-                                    size.width,
-                                    size.height,
-                                )),
-                            };
-                        }
-                    });
+                    let webview_raw = self.window_to_webview.get(&raw).copied();
+                    let _ = webview_raw
+                        .and_then(|wv| self.webviews.get_mut(&wv))
+                        .map(|webview| {
+                            if webview.auto_resize {
+                                webview.bounds = Rect {
+                                    position: Position::Physical(PhysicalPosition::new(0, 0)),
+                                    size: tauri_runtime::dpi::Size::Physical(PhysicalSize::new(
+                                        size.width,
+                                        size.height,
+                                    )),
+                                };
+                            }
+                        });
                 });
             }
             WinitWindowEvent::Moved(position) => {
