@@ -1,4 +1,4 @@
-//! v2.0 implementation of the `tauri_runtime::Runtime` trait surface.
+//! v2.1 implementation of the `tauri_runtime::Runtime` trait surface.
 //!
 //! Backed by a real winit event loop with per-window softbuffer
 //! presentation:
@@ -2513,13 +2513,29 @@ fn present_webview<T: UserEvent>(window: &Window, webview: &mut WebviewState<T>)
         .map_or((255_u8, 255_u8, 255_u8), |color| {
             (color.0, color.1, color.2)
         });
+    // v2.1 visual application of `WebviewDispatch::set_zoom`: sample
+    // the source frame at `1/zoom` per destination pixel.  `zoom == 1`
+    // collapses to direct mapping; non-finite or non-positive values
+    // are clamped to 1.0 to keep the inverse well-defined.
+    let zoom = if webview.zoom.is_finite() && webview.zoom > 0.0 {
+        webview.zoom
+    } else {
+        1.0
+    };
     let context = Context::new(window).ok()?;
     // FFI carve-out: softbuffer's `Surface` / `Buffer` require `&mut`
     // for `resize`, `buffer_mut`, and `present`.
     let mut surface = Surface::new(&context, window).ok()?;
     surface.resize(width, height).ok()?;
     let mut buffer = surface.buffer_mut().ok()?;
-    write_pixels(&pixels, background, &mut buffer);
+    write_pixels(
+        &pixels,
+        background,
+        zoom,
+        size.width,
+        size.height,
+        &mut buffer,
+    );
     buffer.present().ok()?;
     Some(())
 }
@@ -2527,14 +2543,59 @@ fn present_webview<T: UserEvent>(window: &Window, webview: &mut WebviewState<T>)
 fn write_pixels(
     pixels: &PixelBuffer,
     background: (u8, u8, u8),
+    zoom: f64,
+    dst_w: u32,
+    dst_h: u32,
     buffer: &mut softbuffer::Buffer<'_, &Window, &Window>,
 ) {
-    pixels
-        .rgba()
-        .chunks_exact(4)
-        .map(|chunk| rgba_to_softbuffer_word(chunk, background))
+    let src_w = pixels.width().max(1);
+    let src_h = pixels.height().max(1);
+    let inv_zoom = 1.0 / zoom;
+    let rgba = pixels.rgba();
+    let bg_word = bg_to_word(background);
+    (0..dst_h)
+        .flat_map(|y| (0..dst_w).map(move |x| (x, y)))
+        .map(|(x, y)| {
+            sample_source_word(rgba, src_w, src_h, x, y, inv_zoom, background).unwrap_or(bg_word)
+        })
         .zip(buffer.iter_mut())
         .for_each(|(word, slot)| *slot = word);
+}
+
+fn bg_to_word(background: (u8, u8, u8)) -> u32 {
+    let (r, g, b) = background;
+    (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
+}
+
+fn sample_source_word(
+    rgba: &[u8],
+    src_w: u32,
+    src_h: u32,
+    dst_x: u32,
+    dst_y: u32,
+    inv_zoom: f64,
+    background: (u8, u8, u8),
+) -> Option<u32> {
+    let src_x_f = f64::from(dst_x) * inv_zoom;
+    let src_y_f = f64::from(dst_y) * inv_zoom;
+    (src_x_f.is_finite() && src_y_f.is_finite()).then_some(())?;
+    (src_x_f < f64::from(src_w) && src_y_f < f64::from(src_h)).then_some(())?;
+    // FFI carve-out (lossy cast): we need a `u32` pixel index from an
+    // `f64` linear coordinate; the bounds check above keeps the
+    // truncated value within `[0, src_w-1] x [0, src_h-1]`.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let src_x = (src_x_f as u32).min(src_w - 1);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let src_y = (src_y_f as u32).min(src_h - 1);
+    let src_x_usize = usize::try_from(src_x).ok()?;
+    let src_y_usize = usize::try_from(src_y).ok()?;
+    let src_w_usize = usize::try_from(src_w).ok()?;
+    let src_idx = src_y_usize
+        .checked_mul(src_w_usize)?
+        .checked_add(src_x_usize)?
+        .checked_mul(4)?;
+    let chunk = rgba.get(src_idx..src_idx.checked_add(4)?)?;
+    Some(rgba_to_softbuffer_word(chunk, background))
 }
 
 fn rgba_to_softbuffer_word(chunk: &[u8], background: (u8, u8, u8)) -> u32 {
@@ -3275,6 +3336,7 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                 let _ = self.webviews.get_mut(&raw).map(|webview| {
                     webview.zoom = scale;
                 });
+                self.request_redraw_for_webview(raw);
             }
             RuntimeEvent::SetWebviewBackgroundColor { webview_id, color } => {
                 let raw = webview_id.raw();

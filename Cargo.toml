@@ -1,8 +1,8 @@
 [package]
 name = "tauri-runtime-servocat"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2024"
-description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v2.0.0 visually applies the webview's tracked `background_color` (the softbuffer compositor now blends over the chosen colour instead of always white) and attaches the webview's cookie jar to net-cat HTTP requests during `navigate(http://...)` (as a single `Cookie: name=value; ...` header).  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
+description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v2.1.0 applies the webview's tracked zoom factor visually: the softbuffer compositor samples the rasterized frame with `1/zoom` step so `set_zoom(1.5)` makes each source pixel cover a 1.5x1.5 destination block (zoom in, top-left anchored).  Bitmap nearest-neighbour scaling -- crisp re-rasterized text waits on a pipeline-side layout-with-scale-factor pass.  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
 license = "MIT OR Apache-2.0"
 keywords = ["tauri", "runtime", "browser", "servo", "type-driven"]
 categories = ["gui", "rendering"]
