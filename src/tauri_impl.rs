@@ -1,4 +1,4 @@
-//! v3.3 implementation of the `tauri_runtime::Runtime` trait surface.
+//! v3.4 implementation of the `tauri_runtime::Runtime` trait surface.
 //!
 //! Backed by a real winit event loop with per-window softbuffer
 //! presentation:
@@ -2318,9 +2318,10 @@ fn try_http_url(url: &str, cookies: &[Cookie<'static>]) -> Option<(String, Vec<C
     let parsed = url::Url::parse(url).ok()?;
     (parsed.scheme() == "http").then_some(())?;
     let host = parsed.host_str().unwrap_or("");
+    let path = parsed.path();
     let net_url = net_cat::url::Url::parse(url).ok()?;
     let request = net_cat::request::Request::new(net_cat::method::Method::Get, net_url);
-    let request_with_cookies = cookie_header_value(cookies, host)
+    let request_with_cookies = cookie_header_value(cookies, host, path)
         .into_iter()
         .fold(request, |req, header| req.with_header("Cookie", header));
     let response = net_cat::fetch(&request_with_cookies).ok()?;
@@ -2334,18 +2335,43 @@ fn try_http_url(url: &str, cookies: &[Cookie<'static>]) -> Option<(String, Vec<C
     Some((response.body_text(), parsed_cookies))
 }
 
-fn cookie_header_value(cookies: &[Cookie<'static>], host: &str) -> Option<String> {
+fn cookie_header_value(
+    cookies: &[Cookie<'static>],
+    host: &str,
+    request_path: &str,
+) -> Option<String> {
     // v3.2 honours `Expires`: an entry whose absolute expiry time
     // is at or before `now` is omitted from the outbound header
     // even if it lived in the jar.
+    // v3.4 honours `Path=`: only cookies whose `Path` attribute
+    // path-matches the request URL's path are sent.  Path-less
+    // cookies pass through (browsers' default-path treatment).
     let now = cookie::time::OffsetDateTime::now_utc();
     let serialized: Vec<String> = cookies
         .iter()
         .filter(|cookie| !cookie_is_expired(cookie, now))
         .filter(|cookie| cookie.domain().is_none_or(|domain| domain == host))
+        .filter(|cookie| {
+            cookie
+                .path()
+                .is_none_or(|cookie_path| cookie_path_matches(cookie_path, request_path))
+        })
         .map(|cookie| format!("{}={}", cookie.name(), cookie.value()))
         .collect();
     (!serialized.is_empty()).then(|| serialized.join("; "))
+}
+
+/// RFC 6265 path-match: the cookie path "path-matches" the request
+/// path iff they are identical, the cookie path is a prefix of the
+/// request path AND ends with `/`, or the cookie path is a prefix
+/// AND the next char of the request path is `/`.
+fn cookie_path_matches(cookie_path: &str, request_path: &str) -> bool {
+    (cookie_path == request_path)
+        || (request_path.starts_with(cookie_path)
+            && (cookie_path.ends_with('/')
+                || request_path
+                    .get(cookie_path.len()..)
+                    .is_some_and(|tail| tail.starts_with('/'))))
 }
 
 fn merge_cookies(jar: &mut Vec<Cookie<'static>>, new_cookies: Vec<Cookie<'static>>) {
@@ -3660,7 +3686,7 @@ mod tests {
             Cookie::build(("stale", "old")).expires(past).build(),
             Cookie::build(("fresh", "new")).expires(future).build(),
         ];
-        let header = cookie_header_value(&jar, "");
+        let header = cookie_header_value(&jar, "", "/");
         let serialized = header.ok_or_else(|| fail("expected at least one cookie"))?;
         (!serialized.contains("stale") && serialized.contains("fresh"))
             .then_some(())
@@ -3719,6 +3745,49 @@ mod tests {
         (jar.len() == 1 && first.expires().is_some())
             .then_some(())
             .ok_or_else(|| fail("Max-Age>0 should land in jar with Expires set"))
+    }
+
+    #[test]
+    fn path_match_admin_subtree() -> Result<(), tauri_runtime::Error> {
+        use super::cookie_path_matches;
+        // `/admin` matches itself and subtree under it (RFC 6265).
+        (cookie_path_matches("/admin", "/admin")
+            && cookie_path_matches("/admin", "/admin/users")
+            && cookie_path_matches("/admin/", "/admin/users")
+            && cookie_path_matches("/admin/", "/admin/"))
+        .then_some(())
+        .ok_or_else(|| fail("admin paths should match subtree"))
+    }
+
+    #[test]
+    fn path_match_rejects_sibling_prefix() -> Result<(), tauri_runtime::Error> {
+        use super::cookie_path_matches;
+        // `/admin` must NOT match `/administration` (prefix-without-/)
+        // or `/public/...` (no prefix match).
+        (!cookie_path_matches("/admin", "/administration")
+            && !cookie_path_matches("/admin", "/public/page"))
+        .then_some(())
+        .ok_or_else(|| fail("/admin should not match /administration or unrelated paths"))
+    }
+
+    #[test]
+    fn header_filters_by_path() -> Result<(), tauri_runtime::Error> {
+        use cookie::Cookie as CookieBuilder;
+        let admin_cookie = CookieBuilder::build(("token", "x")).path("/admin").build();
+        let global_cookie = CookieBuilder::build(("sid", "y")).build();
+        let jar = vec![admin_cookie, global_cookie];
+        // Request to /public/page: only the path-less cookie applies.
+        let public_header = cookie_header_value(&jar, "", "/public/page")
+            .ok_or_else(|| fail("expected sid for /public/page"))?;
+        // Request to /admin/users: both cookies apply.
+        let admin_header = cookie_header_value(&jar, "", "/admin/users")
+            .ok_or_else(|| fail("expected both for /admin/users"))?;
+        (!public_header.contains("token")
+            && public_header.contains("sid")
+            && admin_header.contains("token")
+            && admin_header.contains("sid"))
+        .then_some(())
+        .ok_or_else(|| fail("path filter did not partition cookies correctly"))
     }
 
     #[test]
