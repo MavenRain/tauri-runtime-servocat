@@ -1,4 +1,4 @@
-//! v2.1 implementation of the `tauri_runtime::Runtime` trait surface.
+//! v2.2 implementation of the `tauri_runtime::Runtime` trait surface.
 //!
 //! Backed by a real winit event loop with per-window softbuffer
 //! presentation:
@@ -2275,23 +2275,24 @@ fn with_ipc_dispatch<T: UserEvent, R>(
     result
 }
 
-/// Extract a usable HTML body from a URL.  v1.4 handles
-/// `data:text/html,<percent-encoded body>`, `file:///...`, and
-/// `http://...` (via net-cat; runs synchronously on the event-loop
-/// thread, so prefer it from `eval_script` only when latency is OK).
-/// v2.0 attaches the webview's cookie jar (matching the URL's host)
-/// as a single `Cookie: name=value; ...` header when fetching
-/// `http://...`.  Falls back to a placeholder body for unsupported
-/// schemes.
-fn html_from_url(url: &str, cookies: &[Cookie<'static>]) -> String {
+/// Extract a usable HTML body from a URL plus any cookies the
+/// response set (only `http://` fetches return cookies; the other
+/// schemes return an empty `Vec`).  v2.2 closes the cookie loop:
+/// `http://` `Set-Cookie` headers are parsed via the `cookie` crate
+/// and returned for the caller to merge into the webview's jar.
+fn html_from_url(url: &str, cookies: &[Cookie<'static>]) -> (String, Vec<Cookie<'static>>) {
     try_data_url(url)
-        .or_else(|| try_file_url(url))
+        .map(|html| (html, Vec::new()))
+        .or_else(|| try_file_url(url).map(|html| (html, Vec::new())))
         .or_else(|| try_http_url(url, cookies))
         .unwrap_or_else(|| {
-            format!(
-                "<html><body><h1>tauri-runtime-servocat</h1>\
-                 <p>Unsupported URL scheme: <code>{url}</code></p>\
-                 </body></html>"
+            (
+                format!(
+                    "<html><body><h1>tauri-runtime-servocat</h1>\
+                     <p>Unsupported URL scheme: <code>{url}</code></p>\
+                     </body></html>"
+                ),
+                Vec::new(),
             )
         })
 }
@@ -2313,7 +2314,7 @@ fn try_file_url(url: &str) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
-fn try_http_url(url: &str, cookies: &[Cookie<'static>]) -> Option<String> {
+fn try_http_url(url: &str, cookies: &[Cookie<'static>]) -> Option<(String, Vec<Cookie<'static>>)> {
     let parsed = url::Url::parse(url).ok()?;
     (parsed.scheme() == "http").then_some(())?;
     let host = parsed.host_str().unwrap_or("");
@@ -2323,7 +2324,14 @@ fn try_http_url(url: &str, cookies: &[Cookie<'static>]) -> Option<String> {
         .into_iter()
         .fold(request, |req, header| req.with_header("Cookie", header));
     let response = net_cat::fetch(&request_with_cookies).ok()?;
-    Some(response.body_text())
+    let parsed_cookies: Vec<Cookie<'static>> = response
+        .headers()
+        .iter()
+        .filter(|(name, _value)| name.eq_ignore_ascii_case("Set-Cookie"))
+        .filter_map(|(_name, value)| Cookie::parse(value.clone()).ok())
+        .map(Cookie::into_owned)
+        .collect();
+    Some((response.body_text(), parsed_cookies))
 }
 
 fn cookie_header_value(cookies: &[Cookie<'static>], host: &str) -> Option<String> {
@@ -2333,6 +2341,20 @@ fn cookie_header_value(cookies: &[Cookie<'static>], host: &str) -> Option<String
         .map(|cookie| format!("{}={}", cookie.name(), cookie.value()))
         .collect();
     (!serialized.is_empty()).then(|| serialized.join("; "))
+}
+
+fn merge_cookies(jar: &mut Vec<Cookie<'static>>, new_cookies: Vec<Cookie<'static>>) {
+    // Replace-by-name semantics: an inbound `Set-Cookie` for the same
+    // name evicts the existing entry, mirroring how
+    // `AddWebviewCookie` already behaves.  `for_each` over an
+    // iterator (rather than a `for` loop) keeps the combinator
+    // style; the lint that prefers `for` is overridden here.
+    #[allow(clippy::needless_for_each)]
+    new_cookies.into_iter().for_each(|cookie| {
+        let name = cookie.name().to_owned();
+        jar.retain(|existing| existing.name() != name.as_str());
+        jar.push(cookie);
+    });
 }
 
 fn print_to_png(
@@ -2777,8 +2799,9 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                 // CreateWebview's webview state has no cookies yet,
                 // so we can't attach any.  Future versions could
                 // accept seeded cookies via `PendingWebview`.
-                let html = html_from_url(&url, &[]);
+                let (html, response_cookies) = html_from_url(&url, &[]);
                 let mut state = WebviewState::new(label, html, viewport, ipc_handler);
+                merge_cookies(&mut state.cookies, response_cookies);
                 state.rebuild_frame();
                 let _ = self.webviews.insert(webview_raw, state);
                 let _ = self.webview_to_window.insert(webview_raw, window_raw);
@@ -2851,9 +2874,10 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                     .get(&webview_raw)
                     .map(|webview| webview.cookies.clone())
                     .unwrap_or_default();
-                let html = html_from_url(&url, &cookies);
+                let (html, response_cookies) = html_from_url(&url, &cookies);
                 let _ = self.webviews.get_mut(&webview_raw).map(|webview| {
                     webview.html = html;
+                    merge_cookies(&mut webview.cookies, response_cookies);
                     webview.rebuild_frame();
                 });
                 self.request_redraw_for_webview(webview_raw);
@@ -3562,5 +3586,36 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         (self.callback)(RunEvent::Exit);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cookie, merge_cookies};
+
+    fn fail(_msg: &'static str) -> tauri_runtime::Error {
+        tauri_runtime::Error::FailedToReceiveMessage
+    }
+
+    #[test]
+    fn merge_replaces_existing_by_name() -> Result<(), tauri_runtime::Error> {
+        let mut jar = vec![Cookie::build(("session", "old")).build()];
+        let incoming = vec![Cookie::build(("session", "new")).build()];
+        merge_cookies(&mut jar, incoming);
+        let first = jar.first().ok_or_else(|| fail("empty jar"))?;
+        (jar.len() == 1 && first.value() == "new")
+            .then_some(())
+            .ok_or_else(|| fail("session was not replaced"))
+    }
+
+    #[test]
+    fn merge_appends_unrelated_names() -> Result<(), tauri_runtime::Error> {
+        let mut jar = vec![Cookie::build(("theme", "dark")).build()];
+        let incoming = vec![Cookie::build(("lang", "en")).build()];
+        merge_cookies(&mut jar, incoming);
+        let names: Vec<String> = jar.iter().map(|c| c.name().to_owned()).collect();
+        (names.iter().any(|n| n == "theme") && names.iter().any(|n| n == "lang"))
+            .then_some(())
+            .ok_or_else(|| fail("expected both theme and lang to be present"))
     }
 }
