@@ -1,8 +1,8 @@
 [package]
 name = "tauri-runtime-servocat"
-version = "3.1.0"
+version = "3.2.0"
 edition = "2024"
-description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.1.0 replaces the local `scale_paint_commands` helper with paint-cat 0.2's upstream `PaintCommand::scaled(factor)` / `DisplayList::scaled(factor)` API, so the per-variant scaling logic lives in the crate that owns the display-list type.  Zoom semantics are unchanged from v3.0; the rasterizer still re-draws at the larger size for crisp text.  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
+description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.2.0 honours the cookie jar's `Expires` attribute: expired entries are dropped at `Set-Cookie` parse time (so an already-expired response cookie never lands in the jar) and filtered out of the outbound `Cookie:` header (so an entry that aged past its expiry between requests stops being sent).  Session cookies (no `Expires`) and unexpired `DateTime` cookies pass through unchanged.  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
 license = "MIT OR Apache-2.0"
 keywords = ["tauri", "runtime", "browser", "servo", "type-driven"]
 categories = ["gui", "rendering"]

@@ -1,4 +1,4 @@
-//! v3.1 implementation of the `tauri_runtime::Runtime` trait surface.
+//! v3.2 implementation of the `tauri_runtime::Runtime` trait surface.
 //!
 //! Backed by a real winit event loop with per-window softbuffer
 //! presentation:
@@ -2335,8 +2335,13 @@ fn try_http_url(url: &str, cookies: &[Cookie<'static>]) -> Option<(String, Vec<C
 }
 
 fn cookie_header_value(cookies: &[Cookie<'static>], host: &str) -> Option<String> {
+    // v3.2 honours `Expires`: an entry whose absolute expiry time
+    // is at or before `now` is omitted from the outbound header
+    // even if it lived in the jar.
+    let now = cookie::time::OffsetDateTime::now_utc();
     let serialized: Vec<String> = cookies
         .iter()
+        .filter(|cookie| !cookie_is_expired(cookie, now))
         .filter(|cookie| cookie.domain().is_none_or(|domain| domain == host))
         .map(|cookie| format!("{}={}", cookie.name(), cookie.value()))
         .collect();
@@ -2346,15 +2351,33 @@ fn cookie_header_value(cookies: &[Cookie<'static>], host: &str) -> Option<String
 fn merge_cookies(jar: &mut Vec<Cookie<'static>>, new_cookies: Vec<Cookie<'static>>) {
     // Replace-by-name semantics: an inbound `Set-Cookie` for the same
     // name evicts the existing entry, mirroring how
-    // `AddWebviewCookie` already behaves.  `for_each` over an
-    // iterator (rather than a `for` loop) keeps the combinator
-    // style; the lint that prefers `for` is overridden here.
+    // `AddWebviewCookie` already behaves.  v3.2: an inbound cookie
+    // whose `Expires` is already in the past is dropped without
+    // entering the jar (so it can't get sent on the next outbound
+    // request).  `for_each` over an iterator (rather than a `for`
+    // loop) keeps the combinator style; the lint that prefers `for`
+    // is overridden here.
+    let now = cookie::time::OffsetDateTime::now_utc();
     #[allow(clippy::needless_for_each)]
-    new_cookies.into_iter().for_each(|cookie| {
-        let name = cookie.name().to_owned();
-        jar.retain(|existing| existing.name() != name.as_str());
-        jar.push(cookie);
-    });
+    new_cookies
+        .into_iter()
+        .filter(|cookie| !cookie_is_expired(cookie, now))
+        .for_each(|cookie| {
+            let name = cookie.name().to_owned();
+            jar.retain(|existing| existing.name() != name.as_str());
+            jar.push(cookie);
+        });
+}
+
+fn cookie_is_expired(cookie: &Cookie<'_>, now: cookie::time::OffsetDateTime) -> bool {
+    // `Cookie::expires` returns `Option<Expiration>` where
+    // `Expiration::DateTime(_)` carries a real expiry instant and
+    // `Expiration::Session` (and `None`) mean "lasts for the
+    // session" -- both pass through this filter unchanged.
+    cookie
+        .expires()
+        .and_then(cookie::Expiration::datetime)
+        .is_some_and(|dt| dt <= now)
 }
 
 fn print_to_png(
@@ -3558,7 +3581,8 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
 
 #[cfg(test)]
 mod tests {
-    use super::{Cookie, merge_cookies};
+    use super::{Cookie, cookie_header_value, cookie_is_expired, merge_cookies};
+    use cookie::time::{Duration, OffsetDateTime};
 
     fn fail(_msg: &'static str) -> tauri_runtime::Error {
         tauri_runtime::Error::FailedToReceiveMessage
@@ -3584,5 +3608,53 @@ mod tests {
         (names.iter().any(|n| n == "theme") && names.iter().any(|n| n == "lang"))
             .then_some(())
             .ok_or_else(|| fail("expected both theme and lang to be present"))
+    }
+
+    #[test]
+    fn merge_drops_already_expired_inbound() -> Result<(), tauri_runtime::Error> {
+        let past = OffsetDateTime::now_utc() - Duration::days(1);
+        let mut jar: Vec<Cookie<'static>> = Vec::new();
+        let incoming = vec![Cookie::build(("stale", "v")).expires(past).build()];
+        merge_cookies(&mut jar, incoming);
+        jar.is_empty()
+            .then_some(())
+            .ok_or_else(|| fail("expired cookie should not enter the jar"))
+    }
+
+    #[test]
+    fn merge_keeps_future_expiry() -> Result<(), tauri_runtime::Error> {
+        let future = OffsetDateTime::now_utc() + Duration::days(1);
+        let mut jar: Vec<Cookie<'static>> = Vec::new();
+        let incoming = vec![Cookie::build(("fresh", "v")).expires(future).build()];
+        merge_cookies(&mut jar, incoming);
+        (jar.len() == 1)
+            .then_some(())
+            .ok_or_else(|| fail("future-expiry cookie should be kept"))
+    }
+
+    #[test]
+    fn header_omits_expired_entries() -> Result<(), tauri_runtime::Error> {
+        let past = OffsetDateTime::now_utc() - Duration::days(1);
+        let future = OffsetDateTime::now_utc() + Duration::days(1);
+        let jar = vec![
+            Cookie::build(("stale", "old")).expires(past).build(),
+            Cookie::build(("fresh", "new")).expires(future).build(),
+        ];
+        let header = cookie_header_value(&jar, "");
+        let serialized = header.ok_or_else(|| fail("expected at least one cookie"))?;
+        (!serialized.contains("stale") && serialized.contains("fresh"))
+            .then_some(())
+            .ok_or_else(|| fail("header should drop stale and keep fresh"))
+    }
+
+    #[test]
+    fn session_cookie_is_not_expired() -> Result<(), tauri_runtime::Error> {
+        // A cookie with no `Expires` is a session cookie; treat it as
+        // not-expired so it stays in the jar across the session.
+        let session = Cookie::build(("sid", "abc")).build();
+        let now = OffsetDateTime::now_utc();
+        (!cookie_is_expired(&session, now))
+            .then_some(())
+            .ok_or_else(|| fail("session cookie wrongly treated as expired"))
     }
 }
