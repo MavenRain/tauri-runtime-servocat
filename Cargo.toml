@@ -1,8 +1,8 @@
 [package]
 name = "tauri-runtime-servocat"
-version = "2.3.0"
+version = "3.0.0"
 edition = "2024"
-description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v2.3.0 upgrades the zoom compositor from nearest-neighbour to bilinear sampling: each destination pixel weights four surrounding source pixels by `(1 - x_frac)`, `x_frac`, `(1 - y_frac)`, `y_frac`, smoothing edges at non-integer zoom factors.  Crisp glyph re-rasterization at zoom waits on a layout-cat font-scale parameter (deferred).  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
+description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.0.0 makes zoom truly crisp: at present time the display list is scaled by `webview.zoom` (rect coords + stroke width + font_size), then re-rasterized via cosmic-text at the larger glyph size before being blitted to softbuffer.  Text appears 2x larger at zoom=2.0 because the rasterizer actually rasterizes glyphs at 2x font_size, not because bitmap pixels are sample-replicated.  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
 license = "MIT OR Apache-2.0"
 keywords = ["tauri", "runtime", "browser", "servo", "type-driven"]
 categories = ["gui", "rendering"]

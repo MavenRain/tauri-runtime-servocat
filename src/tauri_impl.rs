@@ -1,4 +1,4 @@
-//! v2.3 implementation of the `tauri_runtime::Runtime` trait surface.
+//! v3.0 implementation of the `tauri_runtime::Runtime` trait surface.
 //!
 //! Backed by a real winit event loop with per-window softbuffer
 //! presentation:
@@ -100,10 +100,11 @@ use winit::window::{Fullscreen, Window, WindowAttributes, WindowId as WinitWindo
 
 use crate::frame::Frame;
 use crate::ipc::HostCommands;
-use crate::raster::{PixelBuffer, render_to_pixels_with};
+use crate::raster::{PixelBuffer, render_commands_to_pixels_with, render_to_pixels_with};
 use crate::script::run_script_with_backprop;
 use crate::text::TextRenderer;
 use layout_cat::Viewport;
+use paint_cat::PaintCommand;
 
 static NEXT_WINDOW_ID: AtomicU32 = AtomicU32::new(1);
 static NEXT_WEBVIEW_ID: AtomicU32 = AtomicU32::new(1);
@@ -2526,7 +2527,6 @@ fn present_webview<T: UserEvent>(window: &Window, webview: &mut WebviewState<T>)
     let width = NonZeroU32::new(size.width)?;
     let height = NonZeroU32::new(size.height)?;
     let frame = webview.current_frame.as_ref()?;
-    let pixels = render_to_pixels_with(frame, size.width, size.height, &mut webview.text_renderer);
     // v2.0 visual application of `WebviewDispatch::set_background_color`:
     // composite the rasterized page over the tracked background colour
     // instead of always over white.
@@ -2535,14 +2535,21 @@ fn present_webview<T: UserEvent>(window: &Window, webview: &mut WebviewState<T>)
         .map_or((255_u8, 255_u8, 255_u8), |color| {
             (color.0, color.1, color.2)
         });
-    // v2.1 visual application of `WebviewDispatch::set_zoom`: sample
-    // the source frame at `1/zoom` per destination pixel.  `zoom == 1`
-    // collapses to direct mapping; non-finite or non-positive values
-    // are clamped to 1.0 to keep the inverse well-defined.
+    // v3.0 visual application of `WebviewDispatch::set_zoom`: scale
+    // every paint command's geometry + `font_size` by `zoom` so the
+    // rasterizer re-rasterizes glyphs at the larger pixel size (crisp
+    // text instead of v2.3's bitmap nearest/bilinear sampling).  Non-
+    // finite or non-positive values fall back to 1.0.
     let zoom = if webview.zoom.is_finite() && webview.zoom > 0.0 {
         webview.zoom
     } else {
         1.0
+    };
+    let pixels = if (zoom - 1.0).abs() < f64::EPSILON {
+        render_to_pixels_with(frame, size.width, size.height, &mut webview.text_renderer)
+    } else {
+        let scaled = scale_paint_commands(frame.display_list().commands(), zoom);
+        render_commands_to_pixels_with(&scaled, size.width, size.height, &mut webview.text_renderer)
     };
     let context = Context::new(window).ok()?;
     // FFI carve-out: softbuffer's `Surface` / `Buffer` require `&mut`
@@ -2550,119 +2557,75 @@ fn present_webview<T: UserEvent>(window: &Window, webview: &mut WebviewState<T>)
     let mut surface = Surface::new(&context, window).ok()?;
     surface.resize(width, height).ok()?;
     let mut buffer = surface.buffer_mut().ok()?;
-    write_pixels(
-        &pixels,
-        background,
-        zoom,
-        size.width,
-        size.height,
-        &mut buffer,
-    );
+    write_pixels(&pixels, background, &mut buffer);
     buffer.present().ok()?;
     Some(())
+}
+
+fn scale_paint_commands(commands: &[PaintCommand], scale: f64) -> Vec<PaintCommand> {
+    use layout_cat::{Point, Rect as LayoutRect};
+    commands
+        .iter()
+        .map(|cmd| match cmd {
+            PaintCommand::FillRect { rect, color } => PaintCommand::FillRect {
+                rect: scale_rect(rect, scale, |x, y, w, h| {
+                    LayoutRect::new(Point::new(x, y), w, h)
+                }),
+                color: *color,
+            },
+            PaintCommand::StrokeRect { rect, color, width } => PaintCommand::StrokeRect {
+                rect: scale_rect(rect, scale, |x, y, w, h| {
+                    LayoutRect::new(Point::new(x, y), w, h)
+                }),
+                color: *color,
+                width: width * scale,
+            },
+            PaintCommand::FillText {
+                rect,
+                text,
+                color,
+                font_size,
+            } => PaintCommand::FillText {
+                rect: scale_rect(rect, scale, |x, y, w, h| {
+                    LayoutRect::new(Point::new(x, y), w, h)
+                }),
+                text: text.clone(),
+                color: *color,
+                font_size: font_size * scale,
+            },
+        })
+        .collect()
+}
+
+fn scale_rect(
+    rect: &layout_cat::Rect,
+    scale: f64,
+    builder: impl Fn(f64, f64, f64, f64) -> layout_cat::Rect,
+) -> layout_cat::Rect {
+    builder(
+        rect.origin().x() * scale,
+        rect.origin().y() * scale,
+        rect.width() * scale,
+        rect.height() * scale,
+    )
 }
 
 fn write_pixels(
     pixels: &PixelBuffer,
     background: (u8, u8, u8),
-    zoom: f64,
-    dst_w: u32,
-    dst_h: u32,
     buffer: &mut softbuffer::Buffer<'_, &Window, &Window>,
 ) {
-    let src_w = pixels.width().max(1);
-    let src_h = pixels.height().max(1);
-    let inv_zoom = 1.0 / zoom;
-    let rgba = pixels.rgba();
-    let bg_word = bg_to_word(background);
-    (0..dst_h)
-        .flat_map(|y| (0..dst_w).map(move |x| (x, y)))
-        .map(|(x, y)| {
-            sample_source_word(rgba, src_w, src_h, x, y, inv_zoom, background).unwrap_or(bg_word)
-        })
+    // v3.0: the zoom path now scales the display list before
+    // rasterization (so source pixmap matches window dimensions and
+    // text rasterizes crisply at the larger glyph size), which means
+    // the per-pixel sampler is unnecessary -- direct `chunks_exact(4)`
+    // suffices.
+    pixels
+        .rgba()
+        .chunks_exact(4)
+        .map(|chunk| rgba_to_softbuffer_word(chunk, background))
         .zip(buffer.iter_mut())
         .for_each(|(word, slot)| *slot = word);
-}
-
-fn bg_to_word(background: (u8, u8, u8)) -> u32 {
-    let (r, g, b) = background;
-    (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
-}
-
-fn sample_source_word(
-    rgba: &[u8],
-    src_w: u32,
-    src_h: u32,
-    dst_x: u32,
-    dst_y: u32,
-    inv_zoom: f64,
-    background: (u8, u8, u8),
-) -> Option<u32> {
-    let src_x_f = f64::from(dst_x) * inv_zoom;
-    let src_y_f = f64::from(dst_y) * inv_zoom;
-    (src_x_f.is_finite() && src_y_f.is_finite()).then_some(())?;
-    (src_x_f >= 0.0 && src_y_f >= 0.0).then_some(())?;
-    (src_x_f < f64::from(src_w) && src_y_f < f64::from(src_h)).then_some(())?;
-    // v2.3 bilinear interpolation: weight the four surrounding source
-    // pixels by their distance to the floating-point sample point.
-    // For `zoom == 1.0`, the fractional parts are zero and the
-    // formula collapses to a direct lookup of the floor pixel.
-    let x0_f = src_x_f.floor();
-    let y0_f = src_y_f.floor();
-    // FFI carve-out (lossy cast): `u32::try_from(f64)` doesn't exist;
-    // the finiteness + bounds checks above keep both values in the
-    // valid `[0, src_w-1] x [0, src_h-1]` range, so `as u32` is safe.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let x0 = (x0_f as u32).min(src_w - 1);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let y0 = (y0_f as u32).min(src_h - 1);
-    let x1 = x0.saturating_add(1).min(src_w - 1);
-    let y1 = y0.saturating_add(1).min(src_h - 1);
-    let x_frac = src_x_f - x0_f;
-    let y_frac = src_y_f - y0_f;
-    let p00 = sample_pixel(rgba, src_w, x0, y0)?;
-    let p10 = sample_pixel(rgba, src_w, x1, y0)?;
-    let p01 = sample_pixel(rgba, src_w, x0, y1)?;
-    let p11 = sample_pixel(rgba, src_w, x1, y1)?;
-    let w00 = (1.0 - x_frac) * (1.0 - y_frac);
-    let w10 = x_frac * (1.0 - y_frac);
-    let w01 = (1.0 - x_frac) * y_frac;
-    let w11 = x_frac * y_frac;
-    let weights = (w00, w10, w01, w11);
-    let r = blend_channel((p00.0, p10.0, p01.0, p11.0), weights);
-    let g = blend_channel((p00.1, p10.1, p01.1, p11.1), weights);
-    let b = blend_channel((p00.2, p10.2, p01.2, p11.2), weights);
-    let a = blend_channel((p00.3, p10.3, p01.3, p11.3), weights);
-    Some(rgba_to_softbuffer_word(&[r, g, b, a], background))
-}
-
-fn sample_pixel(rgba: &[u8], src_w: u32, x: u32, y: u32) -> Option<(u8, u8, u8, u8)> {
-    let x_usize = usize::try_from(x).ok()?;
-    let y_usize = usize::try_from(y).ok()?;
-    let src_w_usize = usize::try_from(src_w).ok()?;
-    let idx = y_usize
-        .checked_mul(src_w_usize)?
-        .checked_add(x_usize)?
-        .checked_mul(4)?;
-    let chunk = rgba.get(idx..idx.checked_add(4)?)?;
-    let red = chunk.first().copied()?;
-    let green = chunk.get(1).copied()?;
-    let blue = chunk.get(2).copied()?;
-    let alpha = chunk.get(3).copied()?;
-    Some((red, green, blue, alpha))
-}
-
-fn blend_channel(channels: (u8, u8, u8, u8), weights: (f64, f64, f64, f64)) -> u8 {
-    let (p00, p10, p01, p11) = channels;
-    let (w00, w10, w01, w11) = weights;
-    let mixed =
-        f64::from(p00) * w00 + f64::from(p10) * w10 + f64::from(p01) * w01 + f64::from(p11) * w11;
-    // FFI carve-out (lossy cast): the bilinear sum is bounded by the
-    // input channel range `[0, 255]` because the weights sum to 1.
-    // We clamp + cast to `u8`.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let byte = mixed.clamp(0.0, 255.0).round() as u8;
-    byte
 }
 
 fn rgba_to_softbuffer_word(chunk: &[u8], background: (u8, u8, u8)) -> u32 {
@@ -3635,8 +3598,10 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod tests {
-    use super::{Cookie, blend_channel, merge_cookies};
+    use super::{Cookie, PaintCommand, merge_cookies, scale_paint_commands};
+    use layout_cat::{Color, Point, Rect};
 
     fn fail(_msg: &'static str) -> tauri_runtime::Error {
         tauri_runtime::Error::FailedToReceiveMessage
@@ -3665,30 +3630,65 @@ mod tests {
     }
 
     #[test]
-    fn bilinear_corner_weight_selects_single_pixel() -> Result<(), tauri_runtime::Error> {
-        // Weight (0, 0, 0, 1) means "take p11 entirely".
-        let result = blend_channel((10, 20, 30, 40), (0.0, 0.0, 0.0, 1.0));
-        (result == 40)
-            .then_some(())
-            .ok_or_else(|| fail("expected corner weight to select p11"))
+    fn scale_fillrect_scales_geometry() -> Result<(), tauri_runtime::Error> {
+        let input = vec![PaintCommand::FillRect {
+            rect: Rect::new(Point::new(10.0, 20.0), 100.0, 50.0),
+            color: Color::rgba(0.0, 0.0, 0.0, 1.0),
+        }];
+        let scaled = scale_paint_commands(&input, 2.0);
+        let first = scaled.first().ok_or_else(|| fail("empty result"))?;
+        match first {
+            PaintCommand::FillRect { rect, .. } => (rect.origin().x() == 20.0
+                && rect.origin().y() == 40.0
+                && rect.width() == 200.0
+                && rect.height() == 100.0)
+                .then_some(())
+                .ok_or_else(|| fail("FillRect geometry did not double")),
+            PaintCommand::StrokeRect { .. } | PaintCommand::FillText { .. } => {
+                Err(fail("expected FillRect variant"))
+            }
+        }
     }
 
     #[test]
-    fn bilinear_horizontal_midpoint_averages_two_pixels() -> Result<(), tauri_runtime::Error> {
-        // Weight (0.5, 0.5, 0, 0) averages p00 and p10 along the
-        // top edge; 100 and 200 -> 150.
-        let result = blend_channel((100, 200, 0, 0), (0.5, 0.5, 0.0, 0.0));
-        (result == 150)
-            .then_some(())
-            .ok_or_else(|| fail("expected horizontal midpoint to be 150"))
+    fn scale_filltext_scales_font_size() -> Result<(), tauri_runtime::Error> {
+        let input = vec![PaintCommand::FillText {
+            rect: Rect::new(Point::new(0.0, 0.0), 100.0, 30.0),
+            text: "hi".to_owned(),
+            color: Color::rgba(0.0, 0.0, 0.0, 1.0),
+            font_size: 16.0,
+        }];
+        let scaled = scale_paint_commands(&input, 1.5);
+        let first = scaled.first().ok_or_else(|| fail("empty result"))?;
+        match first {
+            PaintCommand::FillText {
+                font_size, rect, ..
+            } => ((*font_size - 24.0).abs() < f64::EPSILON
+                && (rect.width() - 150.0).abs() < f64::EPSILON)
+                .then_some(())
+                .ok_or_else(|| fail("FillText font_size or rect did not scale")),
+            PaintCommand::FillRect { .. } | PaintCommand::StrokeRect { .. } => {
+                Err(fail("expected FillText variant"))
+            }
+        }
     }
 
     #[test]
-    fn bilinear_centroid_averages_all_four() -> Result<(), tauri_runtime::Error> {
-        // Equal 0.25 weights -> simple mean of the four channels.
-        let result = blend_channel((40, 60, 80, 100), (0.25, 0.25, 0.25, 0.25));
-        (result == 70)
-            .then_some(())
-            .ok_or_else(|| fail("expected centroid to be 70"))
+    fn scale_strokerect_scales_width() -> Result<(), tauri_runtime::Error> {
+        let input = vec![PaintCommand::StrokeRect {
+            rect: Rect::new(Point::new(0.0, 0.0), 100.0, 50.0),
+            color: Color::rgba(0.0, 0.0, 0.0, 1.0),
+            width: 2.0,
+        }];
+        let scaled = scale_paint_commands(&input, 3.0);
+        let first = scaled.first().ok_or_else(|| fail("empty result"))?;
+        match first {
+            PaintCommand::StrokeRect { width, .. } => ((*width - 6.0).abs() < f64::EPSILON)
+                .then_some(())
+                .ok_or_else(|| fail("StrokeRect width did not triple")),
+            PaintCommand::FillRect { .. } | PaintCommand::FillText { .. } => {
+                Err(fail("expected StrokeRect variant"))
+            }
+        }
     }
 }

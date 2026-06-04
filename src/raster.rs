@@ -79,7 +79,26 @@ pub fn render_to_pixels_with(
     height: u32,
     text_renderer: &mut TextRenderer,
 ) -> PixelBuffer {
-    let bytes = rasterize_to_bytes(frame, width, height, text_renderer);
+    render_commands_to_pixels_with(
+        frame.display_list().commands(),
+        width,
+        height,
+        text_renderer,
+    )
+}
+
+/// Rasterize a slice of [`PaintCommand`]s into an RGBA pixel buffer.
+/// Useful when the caller needs to mutate or scale the display list
+/// before rasterization (see the v3 zoom path in
+/// `crate::tauri_impl`).
+#[must_use]
+pub fn render_commands_to_pixels_with(
+    commands: &[PaintCommand],
+    width: u32,
+    height: u32,
+    text_renderer: &mut TextRenderer,
+) -> PixelBuffer {
+    let bytes = rasterize_to_bytes(commands, width, height, text_renderer);
     PixelBuffer {
         width,
         height,
@@ -88,14 +107,14 @@ pub fn render_to_pixels_with(
 }
 
 fn rasterize_to_bytes(
-    frame: &Frame,
+    commands: &[PaintCommand],
     width: u32,
     height: u32,
     text_renderer: &mut TextRenderer,
 ) -> Vec<u8> {
     Pixmap::new(width, height).map_or_else(
         || empty_bytes(width, height),
-        |pixmap| paint_commands(pixmap, frame, text_renderer),
+        |pixmap| paint_commands(pixmap, commands, text_renderer),
     )
 }
 
@@ -111,13 +130,20 @@ fn empty_bytes(width: u32, height: u32) -> Vec<u8> {
     vec![0; total]
 }
 
-fn paint_commands(pixmap_in: Pixmap, frame: &Frame, text_renderer: &mut TextRenderer) -> Vec<u8> {
+fn paint_commands(
+    pixmap_in: Pixmap,
+    commands: &[PaintCommand],
+    text_renderer: &mut TextRenderer,
+) -> Vec<u8> {
     // External `&mut self` carve-out for tiny-skia's `fill_path` /
     // `stroke_path`.  Pixmap construction returns an owned value; we
     // shadow the binding as `mut` only to satisfy the tiny-skia API.
     let mut pixmap = pixmap_in;
     pixmap.fill(tiny_skia::Color::TRANSPARENT);
-    frame.display_list().commands().iter().for_each(|cmd| {
+    // `for_each` over an iterator (not a `for` loop) preserves
+    // combinator style; the lint that prefers `for` is overridden.
+    #[allow(clippy::needless_for_each)]
+    commands.iter().for_each(|cmd| {
         apply_command(&mut pixmap, cmd, text_renderer);
     });
     pixmap.take()
