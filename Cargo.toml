@@ -1,8 +1,8 @@
 [package]
 name = "tauri-runtime-servocat"
-version = "2.2.0"
+version = "2.3.0"
 edition = "2024"
-description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v2.2.0 closes the cookie loop: `http://` navigates now parse `Set-Cookie` response headers and merge them into the webview's jar (replace-by-name semantics), so a navigation that sets a cookie persists for the next request without the host having to call `set_cookie` from Rust.  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
+description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v2.3.0 upgrades the zoom compositor from nearest-neighbour to bilinear sampling: each destination pixel weights four surrounding source pixels by `(1 - x_frac)`, `x_frac`, `(1 - y_frac)`, `y_frac`, smoothing edges at non-integer zoom factors.  Crisp glyph re-rasterization at zoom waits on a layout-cat font-scale parameter (deferred).  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
 license = "MIT OR Apache-2.0"
 keywords = ["tauri", "runtime", "browser", "servo", "type-driven"]
 categories = ["gui", "rendering"]

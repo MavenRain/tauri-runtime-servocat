@@ -1,4 +1,4 @@
-//! v2.2 implementation of the `tauri_runtime::Runtime` trait surface.
+//! v2.3 implementation of the `tauri_runtime::Runtime` trait surface.
 //!
 //! Backed by a real winit event loop with per-window softbuffer
 //! presentation:
@@ -2601,23 +2601,68 @@ fn sample_source_word(
     let src_x_f = f64::from(dst_x) * inv_zoom;
     let src_y_f = f64::from(dst_y) * inv_zoom;
     (src_x_f.is_finite() && src_y_f.is_finite()).then_some(())?;
+    (src_x_f >= 0.0 && src_y_f >= 0.0).then_some(())?;
     (src_x_f < f64::from(src_w) && src_y_f < f64::from(src_h)).then_some(())?;
-    // FFI carve-out (lossy cast): we need a `u32` pixel index from an
-    // `f64` linear coordinate; the bounds check above keeps the
-    // truncated value within `[0, src_w-1] x [0, src_h-1]`.
+    // v2.3 bilinear interpolation: weight the four surrounding source
+    // pixels by their distance to the floating-point sample point.
+    // For `zoom == 1.0`, the fractional parts are zero and the
+    // formula collapses to a direct lookup of the floor pixel.
+    let x0_f = src_x_f.floor();
+    let y0_f = src_y_f.floor();
+    // FFI carve-out (lossy cast): `u32::try_from(f64)` doesn't exist;
+    // the finiteness + bounds checks above keep both values in the
+    // valid `[0, src_w-1] x [0, src_h-1]` range, so `as u32` is safe.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let src_x = (src_x_f as u32).min(src_w - 1);
+    let x0 = (x0_f as u32).min(src_w - 1);
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let src_y = (src_y_f as u32).min(src_h - 1);
-    let src_x_usize = usize::try_from(src_x).ok()?;
-    let src_y_usize = usize::try_from(src_y).ok()?;
+    let y0 = (y0_f as u32).min(src_h - 1);
+    let x1 = x0.saturating_add(1).min(src_w - 1);
+    let y1 = y0.saturating_add(1).min(src_h - 1);
+    let x_frac = src_x_f - x0_f;
+    let y_frac = src_y_f - y0_f;
+    let p00 = sample_pixel(rgba, src_w, x0, y0)?;
+    let p10 = sample_pixel(rgba, src_w, x1, y0)?;
+    let p01 = sample_pixel(rgba, src_w, x0, y1)?;
+    let p11 = sample_pixel(rgba, src_w, x1, y1)?;
+    let w00 = (1.0 - x_frac) * (1.0 - y_frac);
+    let w10 = x_frac * (1.0 - y_frac);
+    let w01 = (1.0 - x_frac) * y_frac;
+    let w11 = x_frac * y_frac;
+    let weights = (w00, w10, w01, w11);
+    let r = blend_channel((p00.0, p10.0, p01.0, p11.0), weights);
+    let g = blend_channel((p00.1, p10.1, p01.1, p11.1), weights);
+    let b = blend_channel((p00.2, p10.2, p01.2, p11.2), weights);
+    let a = blend_channel((p00.3, p10.3, p01.3, p11.3), weights);
+    Some(rgba_to_softbuffer_word(&[r, g, b, a], background))
+}
+
+fn sample_pixel(rgba: &[u8], src_w: u32, x: u32, y: u32) -> Option<(u8, u8, u8, u8)> {
+    let x_usize = usize::try_from(x).ok()?;
+    let y_usize = usize::try_from(y).ok()?;
     let src_w_usize = usize::try_from(src_w).ok()?;
-    let src_idx = src_y_usize
+    let idx = y_usize
         .checked_mul(src_w_usize)?
-        .checked_add(src_x_usize)?
+        .checked_add(x_usize)?
         .checked_mul(4)?;
-    let chunk = rgba.get(src_idx..src_idx.checked_add(4)?)?;
-    Some(rgba_to_softbuffer_word(chunk, background))
+    let chunk = rgba.get(idx..idx.checked_add(4)?)?;
+    let red = chunk.first().copied()?;
+    let green = chunk.get(1).copied()?;
+    let blue = chunk.get(2).copied()?;
+    let alpha = chunk.get(3).copied()?;
+    Some((red, green, blue, alpha))
+}
+
+fn blend_channel(channels: (u8, u8, u8, u8), weights: (f64, f64, f64, f64)) -> u8 {
+    let (p00, p10, p01, p11) = channels;
+    let (w00, w10, w01, w11) = weights;
+    let mixed =
+        f64::from(p00) * w00 + f64::from(p10) * w10 + f64::from(p01) * w01 + f64::from(p11) * w11;
+    // FFI carve-out (lossy cast): the bilinear sum is bounded by the
+    // input channel range `[0, 255]` because the weights sum to 1.
+    // We clamp + cast to `u8`.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let byte = mixed.clamp(0.0, 255.0).round() as u8;
+    byte
 }
 
 fn rgba_to_softbuffer_word(chunk: &[u8], background: (u8, u8, u8)) -> u32 {
@@ -3591,7 +3636,7 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
 
 #[cfg(test)]
 mod tests {
-    use super::{Cookie, merge_cookies};
+    use super::{Cookie, blend_channel, merge_cookies};
 
     fn fail(_msg: &'static str) -> tauri_runtime::Error {
         tauri_runtime::Error::FailedToReceiveMessage
@@ -3617,5 +3662,33 @@ mod tests {
         (names.iter().any(|n| n == "theme") && names.iter().any(|n| n == "lang"))
             .then_some(())
             .ok_or_else(|| fail("expected both theme and lang to be present"))
+    }
+
+    #[test]
+    fn bilinear_corner_weight_selects_single_pixel() -> Result<(), tauri_runtime::Error> {
+        // Weight (0, 0, 0, 1) means "take p11 entirely".
+        let result = blend_channel((10, 20, 30, 40), (0.0, 0.0, 0.0, 1.0));
+        (result == 40)
+            .then_some(())
+            .ok_or_else(|| fail("expected corner weight to select p11"))
+    }
+
+    #[test]
+    fn bilinear_horizontal_midpoint_averages_two_pixels() -> Result<(), tauri_runtime::Error> {
+        // Weight (0.5, 0.5, 0, 0) averages p00 and p10 along the
+        // top edge; 100 and 200 -> 150.
+        let result = blend_channel((100, 200, 0, 0), (0.5, 0.5, 0.0, 0.0));
+        (result == 150)
+            .then_some(())
+            .ok_or_else(|| fail("expected horizontal midpoint to be 150"))
+    }
+
+    #[test]
+    fn bilinear_centroid_averages_all_four() -> Result<(), tauri_runtime::Error> {
+        // Equal 0.25 weights -> simple mean of the four channels.
+        let result = blend_channel((40, 60, 80, 100), (0.25, 0.25, 0.25, 0.25));
+        (result == 70)
+            .then_some(())
+            .ok_or_else(|| fail("expected centroid to be 70"))
     }
 }
