@@ -101,7 +101,7 @@ use winit::window::{Fullscreen, Window, WindowAttributes, WindowId as WinitWindo
 use crate::frame::Frame;
 use crate::ipc::HostCommands;
 use crate::raster::{PixelBuffer, render_commands_to_pixels_with, render_to_pixels_with};
-use crate::script::run_script_with_backprop;
+use crate::script::run_script_with_cookies;
 use crate::text::TextRenderer;
 use layout_cat::Viewport;
 
@@ -2241,18 +2241,58 @@ impl<T: UserEvent> WebviewState<T> {
     }
 
     fn eval(&mut self, script: &str) -> Option<String> {
-        let frame = run_script_with_backprop(
+        // v3.6: build the JS-visible projection of the jar (drop
+        // `HttpOnly` and expired entries per RFC 6265 §5.2.6 and
+        // §5.3), hand it to `document.cookie` for the duration of the
+        // script, and merge any post-eval writes back in by name.
+        // The wire path (`cookie_header_value`) still sees the full
+        // jar including `HttpOnly` entries -- that filter is only
+        // relevant to scripting visibility.
+        let outbound = js_visible_cookie_string(&self.cookies);
+        let (frame, post_eval) = run_script_with_cookies(
             &self.html,
             &self.css,
             script,
             self.viewport,
             &HostCommands::new().with("post_ipc_message", post_ipc_message_impl),
+            &outbound,
         )
         .ok()?;
+        let parsed_js_writes = parse_js_cookie_writes(post_eval.as_deref(), &outbound);
+        merge_cookies(&mut self.cookies, parsed_js_writes);
         let value = format!("{}", frame.script_value());
         self.current_frame = Some(frame);
         Some(value)
     }
+}
+
+/// Serialize the JS-visible portion of `jar` as a single
+/// `name1=value1; name2=value2` string for `document.cookie`.
+/// `HttpOnly` and already-expired entries are excluded.
+fn js_visible_cookie_string(jar: &[Cookie<'static>]) -> String {
+    let now = cookie::time::OffsetDateTime::now_utc();
+    jar.iter()
+        .filter(|cookie| !cookie_is_expired(cookie, now))
+        .filter(|cookie| cookie.http_only() != Some(true))
+        .map(|cookie| format!("{}={}", cookie.name(), cookie.value()))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Parse what JS left in `document.cookie` after the script ran.
+/// Returns an empty `Vec` when JS didn't touch the slot (post-eval ==
+/// outbound) or when the heap didn't surface a string.  Otherwise
+/// `Cookie::split_parse` walks the slot's `; `-separated entries.
+/// `merge_cookies` (replace-by-name) folds the result into the jar.
+fn parse_js_cookie_writes(post_eval: Option<&str>, outbound: &str) -> Vec<Cookie<'static>> {
+    post_eval
+        .filter(|post| *post != outbound)
+        .map(|post| {
+            Cookie::split_parse(post.to_owned())
+                .filter_map(|parsed| parsed.ok().map(Cookie::into_owned))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Install a thread-local IPC dispatcher pointing at the given
@@ -3634,7 +3674,10 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
 
 #[cfg(test)]
 mod tests {
-    use super::{Cookie, cookie_header_value, cookie_is_expired, merge_cookies};
+    use super::{
+        Cookie, cookie_header_value, cookie_is_expired, js_visible_cookie_string, merge_cookies,
+        parse_js_cookie_writes,
+    };
     use cookie::time::{Duration, OffsetDateTime};
 
     fn fail(_msg: &'static str) -> tauri_runtime::Error {
@@ -3850,5 +3893,80 @@ mod tests {
         jar.is_empty()
             .then_some(())
             .ok_or_else(|| fail("Max-Age should override Expires per RFC 6265"))
+    }
+
+    #[test]
+    fn js_visible_includes_plain_cookies() -> Result<(), tauri_runtime::Error> {
+        let jar = vec![
+            Cookie::build(("a", "1")).build(),
+            Cookie::build(("b", "2")).build(),
+        ];
+        let rendered = js_visible_cookie_string(&jar);
+        (rendered.contains("a=1") && rendered.contains("b=2"))
+            .then_some(())
+            .ok_or_else(|| fail("plain cookies should be JS-visible"))
+    }
+
+    #[test]
+    fn js_visible_drops_http_only() -> Result<(), tauri_runtime::Error> {
+        let jar = vec![
+            Cookie::build(("public", "ok")).build(),
+            Cookie::build(("secret", "hide")).http_only(true).build(),
+        ];
+        let rendered = js_visible_cookie_string(&jar);
+        (rendered.contains("public=ok") && !rendered.contains("secret"))
+            .then_some(())
+            .ok_or_else(|| fail("HttpOnly cookies must not reach document.cookie"))
+    }
+
+    #[test]
+    fn js_visible_drops_expired() -> Result<(), tauri_runtime::Error> {
+        let past = OffsetDateTime::now_utc() - Duration::days(1);
+        let jar = vec![
+            Cookie::build(("fresh", "v")).build(),
+            Cookie::build(("stale", "v")).expires(past).build(),
+        ];
+        let rendered = js_visible_cookie_string(&jar);
+        (rendered.contains("fresh=v") && !rendered.contains("stale"))
+            .then_some(())
+            .ok_or_else(|| fail("expired cookies must not reach document.cookie"))
+    }
+
+    #[test]
+    fn parse_js_cookie_writes_no_change_yields_empty() -> Result<(), tauri_runtime::Error> {
+        let parsed = parse_js_cookie_writes(Some("a=1"), "a=1");
+        parsed
+            .is_empty()
+            .then_some(())
+            .ok_or_else(|| fail("no diff should produce no parsed writes"))
+    }
+
+    #[test]
+    fn parse_js_cookie_writes_extracts_new_pair() -> Result<(), tauri_runtime::Error> {
+        let parsed = parse_js_cookie_writes(Some("a=1; b=2"), "a=1");
+        let names: Vec<String> = parsed.iter().map(|c| c.name().to_owned()).collect();
+        (names.iter().any(|n| n == "b"))
+            .then_some(())
+            .ok_or_else(|| fail("appended cookie should surface in the diff"))
+    }
+
+    #[test]
+    fn parse_js_cookie_writes_handles_overwrite() -> Result<(), tauri_runtime::Error> {
+        let parsed = parse_js_cookie_writes(Some("a=99"), "a=1");
+        let first = parsed
+            .first()
+            .ok_or_else(|| fail("expected parsed entry"))?;
+        (first.name() == "a" && first.value() == "99")
+            .then_some(())
+            .ok_or_else(|| fail("overwrite should land as the new value"))
+    }
+
+    #[test]
+    fn parse_js_cookie_writes_handles_missing_slot() -> Result<(), tauri_runtime::Error> {
+        let parsed = parse_js_cookie_writes(None, "a=1");
+        parsed
+            .is_empty()
+            .then_some(())
+            .ok_or_else(|| fail("a missing slot should be a no-op merge"))
     }
 }

@@ -4,7 +4,9 @@
 
 use boa_cat::Value;
 use paint_cat::PaintCommand;
-use tauri_runtime_servocat::{Error, Viewport, render, run_script};
+use tauri_runtime_servocat::{
+    Error, HostCommands, Viewport, render, run_script, run_script_with_cookies,
+};
 
 fn fail(_msg: &'static str) -> Error {
     Error::Engine(boa_cat::Error::Unsupported { feature: "test" })
@@ -124,4 +126,35 @@ fn run_script_layout_still_produced() -> Result<(), Error> {
     (!frame.display_list().is_empty())
         .then_some(())
         .ok_or_else(|| fail("expected display list alongside script"))
+}
+
+#[test]
+fn document_cookie_seeded_value_visible_to_js() -> Result<(), Error> {
+    let (frame, _post) = run_script_with_cookies(
+        "<html></html>",
+        "",
+        "document.cookie",
+        Viewport::new(400, 300),
+        &HostCommands::new(),
+        "session=abc",
+    )?;
+    matches!(frame.script_value(), Value::String(s) if s == "session=abc")
+        .then_some(())
+        .ok_or_else(|| fail("expected the seeded cookie string from JS"))
+}
+
+#[test]
+fn document_cookie_js_write_reaches_post_eval() -> Result<(), Error> {
+    let (_frame, post) = run_script_with_cookies(
+        "<html></html>",
+        "",
+        "document.cookie = 'theme=dark'; document.cookie",
+        Viewport::new(400, 300),
+        &HostCommands::new(),
+        "",
+    )?;
+    post.as_deref()
+        .filter(|s| *s == "theme=dark")
+        .map(|_| ())
+        .ok_or_else(|| fail("post-eval slot should carry the JS-written value"))
 }

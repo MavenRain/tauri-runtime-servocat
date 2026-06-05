@@ -54,7 +54,10 @@ pub use ipc::HostCommands;
 pub use layout_cat::Viewport;
 pub use pipeline::render;
 pub use raster::{PixelBuffer, render_to_pixels, render_to_pixels_with};
-pub use script::{DEFAULT_FUEL, run_script, run_script_with_backprop, run_script_with_commands};
+pub use script::{
+    DEFAULT_FUEL, run_script, run_script_with_backprop, run_script_with_commands,
+    run_script_with_cookies,
+};
 pub use tauri_impl::{
     ServocatEventLoopProxy, ServocatHandle, ServocatRuntime, ServocatWebviewDispatch,
     ServocatWindowBuilder, ServocatWindowDispatch, WebviewId,

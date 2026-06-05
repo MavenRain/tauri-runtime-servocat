@@ -100,10 +100,39 @@ pub fn run_script_with_backprop(
     viewport: Viewport,
     commands: &HostCommands,
 ) -> Result<Frame, Error> {
+    run_script_with_cookies(html_source, css_source, js_source, viewport, commands, "")
+        .map(|(frame, _post_eval)| frame)
+}
+
+/// Variant of [`run_script_with_backprop`] that also synchronizes a
+/// cookie string in and out of `document.cookie`.  `cookie_string`
+/// is pushed into `document.cookie` via
+/// [`web_api_cat::set_document_cookie`] before the JS step, and the
+/// post-script value of `document.cookie` is returned alongside the
+/// frame so the caller can parse + merge any writes JS made.
+///
+/// The caller is responsible for the JS-visibility filter on
+/// `cookie_string` (e.g. dropping `HttpOnly` entries) and for parsing
+/// the post-eval string back into cookie objects.  This function
+/// only shuttles strings.
+///
+/// # Errors
+///
+/// Propagates parser, lexer, and JS engine errors.
+pub fn run_script_with_cookies(
+    html_source: &str,
+    css_source: &str,
+    js_source: &str,
+    viewport: Viewport,
+    commands: &HostCommands,
+    cookie_string: &str,
+) -> Result<(Frame, Option<String>), Error> {
     let prepared = prepare(html_source, css_source, viewport, commands)?;
     let document_value = prepared.document_value.clone();
     let stylesheet = prepared.stylesheet.clone();
-    let (value, heap) = evaluate(js_source, prepared.env, prepared.heap)?;
+    let heap = web_api_cat::set_document_cookie(&document_value, prepared.heap, cookie_string);
+    let (value, heap) = evaluate(js_source, prepared.env, heap)?;
+    let post_eval = web_api_cat::get_document_cookie(&document_value, &heap);
     let (dom, layout_tree, display_list) = extract_document(&document_value, &heap)
         .map(|extracted_dom| {
             let new_layout = layout_cat::layout(&extracted_dom, &stylesheet, viewport);
@@ -111,7 +140,10 @@ pub fn run_script_with_backprop(
             (extracted_dom, new_layout, new_display)
         })
         .unwrap_or((prepared.dom, prepared.layout_tree, prepared.display_list));
-    Ok(Frame::new(dom, layout_tree, display_list, value, heap))
+    Ok((
+        Frame::new(dom, layout_tree, display_list, value, heap),
+        post_eval,
+    ))
 }
 
 struct Prepared {
