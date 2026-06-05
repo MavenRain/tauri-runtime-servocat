@@ -1,4 +1,4 @@
-//! v3.4 implementation of the `tauri_runtime::Runtime` trait surface.
+//! v3.5 implementation of the `tauri_runtime::Runtime` trait surface.
 //!
 //! Backed by a real winit event loop with per-window softbuffer
 //! presentation:
@@ -2319,9 +2319,10 @@ fn try_http_url(url: &str, cookies: &[Cookie<'static>]) -> Option<(String, Vec<C
     (parsed.scheme() == "http").then_some(())?;
     let host = parsed.host_str().unwrap_or("");
     let path = parsed.path();
+    let scheme = parsed.scheme();
     let net_url = net_cat::url::Url::parse(url).ok()?;
     let request = net_cat::request::Request::new(net_cat::method::Method::Get, net_url);
-    let request_with_cookies = cookie_header_value(cookies, host, path)
+    let request_with_cookies = cookie_header_value(cookies, host, path, scheme)
         .into_iter()
         .fold(request, |req, header| req.with_header("Cookie", header));
     let response = net_cat::fetch(&request_with_cookies).ok()?;
@@ -2339,6 +2340,7 @@ fn cookie_header_value(
     cookies: &[Cookie<'static>],
     host: &str,
     request_path: &str,
+    request_scheme: &str,
 ) -> Option<String> {
     // v3.2 honours `Expires`: an entry whose absolute expiry time
     // is at or before `now` is omitted from the outbound header
@@ -2346,7 +2348,11 @@ fn cookie_header_value(
     // v3.4 honours `Path=`: only cookies whose `Path` attribute
     // path-matches the request URL's path are sent.  Path-less
     // cookies pass through (browsers' default-path treatment).
+    // v3.5 honours `Secure=`: a cookie marked `Secure` is only sent
+    // on an `https://` request.  `request_scheme` is matched
+    // case-insensitively against `"https"`.
     let now = cookie::time::OffsetDateTime::now_utc();
+    let secure_channel = request_scheme.eq_ignore_ascii_case("https");
     let serialized: Vec<String> = cookies
         .iter()
         .filter(|cookie| !cookie_is_expired(cookie, now))
@@ -2356,6 +2362,7 @@ fn cookie_header_value(
                 .path()
                 .is_none_or(|cookie_path| cookie_path_matches(cookie_path, request_path))
         })
+        .filter(|cookie| secure_channel || cookie.secure() != Some(true))
         .map(|cookie| format!("{}={}", cookie.name(), cookie.value()))
         .collect();
     (!serialized.is_empty()).then(|| serialized.join("; "))
@@ -3686,7 +3693,7 @@ mod tests {
             Cookie::build(("stale", "old")).expires(past).build(),
             Cookie::build(("fresh", "new")).expires(future).build(),
         ];
-        let header = cookie_header_value(&jar, "", "/");
+        let header = cookie_header_value(&jar, "", "/", "http");
         let serialized = header.ok_or_else(|| fail("expected at least one cookie"))?;
         (!serialized.contains("stale") && serialized.contains("fresh"))
             .then_some(())
@@ -3777,10 +3784,10 @@ mod tests {
         let global_cookie = CookieBuilder::build(("sid", "y")).build();
         let jar = vec![admin_cookie, global_cookie];
         // Request to /public/page: only the path-less cookie applies.
-        let public_header = cookie_header_value(&jar, "", "/public/page")
+        let public_header = cookie_header_value(&jar, "", "/public/page", "http")
             .ok_or_else(|| fail("expected sid for /public/page"))?;
         // Request to /admin/users: both cookies apply.
-        let admin_header = cookie_header_value(&jar, "", "/admin/users")
+        let admin_header = cookie_header_value(&jar, "", "/admin/users", "http")
             .ok_or_else(|| fail("expected both for /admin/users"))?;
         (!public_header.contains("token")
             && public_header.contains("sid")
@@ -3788,6 +3795,42 @@ mod tests {
             && admin_header.contains("sid"))
         .then_some(())
         .ok_or_else(|| fail("path filter did not partition cookies correctly"))
+    }
+
+    #[test]
+    fn secure_cookie_skipped_on_http() -> Result<(), tauri_runtime::Error> {
+        let secure_cookie = Cookie::build(("auth", "v")).secure(true).build();
+        let plain_cookie = Cookie::build(("sid", "w")).build();
+        let jar = vec![secure_cookie, plain_cookie];
+        let header = cookie_header_value(&jar, "", "/", "http")
+            .ok_or_else(|| fail("expected sid on http"))?;
+        (!header.contains("auth") && header.contains("sid"))
+            .then_some(())
+            .ok_or_else(|| fail("Secure cookie should be omitted on http"))
+    }
+
+    #[test]
+    fn secure_cookie_sent_on_https() -> Result<(), tauri_runtime::Error> {
+        let secure_cookie = Cookie::build(("auth", "v")).secure(true).build();
+        let plain_cookie = Cookie::build(("sid", "w")).build();
+        let jar = vec![secure_cookie, plain_cookie];
+        let header = cookie_header_value(&jar, "", "/", "https")
+            .ok_or_else(|| fail("expected both on https"))?;
+        (header.contains("auth") && header.contains("sid"))
+            .then_some(())
+            .ok_or_else(|| fail("Secure cookie should be sent on https"))
+    }
+
+    #[test]
+    fn scheme_match_is_case_insensitive() -> Result<(), tauri_runtime::Error> {
+        let secure_cookie = Cookie::build(("auth", "v")).secure(true).build();
+        let jar = vec![secure_cookie];
+        let header = cookie_header_value(&jar, "", "/", "HTTPS")
+            .ok_or_else(|| fail("expected uppercase HTTPS to match"))?;
+        header
+            .contains("auth")
+            .then_some(())
+            .ok_or_else(|| fail("Secure should ship on case-insensitive https"))
     }
 
     #[test]

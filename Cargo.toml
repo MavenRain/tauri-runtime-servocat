@@ -1,8 +1,8 @@
 [package]
 name = "tauri-runtime-servocat"
-version = "3.4.0"
+version = "3.5.0"
 edition = "2024"
-description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.4.0 honours `Path=` on outbound `Cookie:` headers per RFC 6265: a cookie set on `/admin` is not sent on `/public/page`.  Path-less cookies pass through (browsers' default-path treatment).  Combined with the v2.2 host filter, v3.2 `Expires`, and v3.3 `Max-Age` rewrite, the outbound cookie set now matches what a real browser would send.  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
+description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.5.0 honours `Secure=` on outbound `Cookie:` headers per RFC 6265: a cookie marked `Secure` is sent only on `https://` requests.  `cookie_header_value` takes a `request_scheme` argument; `try_http_url` passes `\"http\"`, so `Secure` cookies are filtered out of every outbound header until net-cat grows TLS support and an `https://` path lands.  `HttpOnly` still waits on web-api-cat exposing `document.cookie` to JS.  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
 license = "MIT OR Apache-2.0"
 keywords = ["tauri", "runtime", "browser", "servo", "type-driven"]
 categories = ["gui", "rendering"]
