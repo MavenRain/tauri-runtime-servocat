@@ -1,8 +1,8 @@
 [package]
 name = "tauri-runtime-servocat"
-version = "3.7.0"
+version = "3.8.0"
 edition = "2024"
-description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.7.0 opts into net-cat v0.2's `tls` feature and broadens `try_http_url` to accept both `http://` and `https://`, so webview navigation can fetch real TLS-protected URLs; the v3.5 `Secure=` cookie filter that had been dropping every `Secure` entry now starts including them on `https://` requests.  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
+description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.8.0 teaches `parse_js_cookie_writes` to recognise Set-Cookie-style single assignments: when JS does `document.cookie = \"name=v; Max-Age=600; Path=/\"`, `Cookie::parse` is tried first and the resulting attribute-bearing cookie is merged whole; plain multi-entry strings still fall back to `Cookie::split_parse` so the v3.6 multi-merge behaviour is preserved.  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
 license = "MIT OR Apache-2.0"
 keywords = ["tauri", "runtime", "browser", "servo", "type-driven"]
 categories = ["gui", "rendering"]

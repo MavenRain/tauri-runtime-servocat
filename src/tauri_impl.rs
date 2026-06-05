@@ -2281,18 +2281,49 @@ fn js_visible_cookie_string(jar: &[Cookie<'static>]) -> String {
 
 /// Parse what JS left in `document.cookie` after the script ran.
 /// Returns an empty `Vec` when JS didn't touch the slot (post-eval ==
-/// outbound) or when the heap didn't surface a string.  Otherwise
-/// `Cookie::split_parse` walks the slot's `; `-separated entries.
-/// `merge_cookies` (replace-by-name) folds the result into the jar.
+/// outbound) or when the heap didn't surface a string.
+///
+/// v3.8 first tries `Cookie::parse` on the whole post-eval string
+/// to detect a Set-Cookie-style single assignment that JS wrote
+/// (e.g. `document.cookie = "name=value; Max-Age=600; Path=/"`).
+/// If the parsed cookie carries any attribute (`Max-Age`,
+/// `Expires`, `Path`, `Domain`, `Secure`, `HttpOnly`, `SameSite`)
+/// the whole string is treated as one cookie with attributes,
+/// preserving them through `merge_cookies` (which the host calls
+/// next).  Otherwise we fall back to v3.6's `Cookie::split_parse`
+/// behaviour so plain multi-entry strings like `"old=1; new=2"`
+/// still split and merge as two separate cookies by name.
 fn parse_js_cookie_writes(post_eval: Option<&str>, outbound: &str) -> Vec<Cookie<'static>> {
     post_eval
         .filter(|post| *post != outbound)
         .map(|post| {
-            Cookie::split_parse(post.to_owned())
-                .filter_map(|parsed| parsed.ok().map(Cookie::into_owned))
-                .collect()
+            parse_single_cookie_with_attrs(post)
+                .map_or_else(|| split_parse_all(post), |cookie| vec![cookie])
         })
         .unwrap_or_default()
+}
+
+fn parse_single_cookie_with_attrs(text: &str) -> Option<Cookie<'static>> {
+    Cookie::parse(text.to_owned())
+        .ok()
+        .filter(cookie_has_any_attribute)
+        .map(Cookie::into_owned)
+}
+
+fn cookie_has_any_attribute(cookie: &Cookie<'_>) -> bool {
+    cookie.max_age().is_some()
+        || cookie.expires().is_some()
+        || cookie.path().is_some()
+        || cookie.domain().is_some()
+        || cookie.secure().is_some()
+        || cookie.http_only().is_some()
+        || cookie.same_site().is_some()
+}
+
+fn split_parse_all(text: &str) -> Vec<Cookie<'static>> {
+    Cookie::split_parse(text.to_owned())
+        .filter_map(|parsed| parsed.ok().map(Cookie::into_owned))
+        .collect()
 }
 
 /// Install a thread-local IPC dispatcher pointing at the given
@@ -3976,5 +4007,66 @@ mod tests {
             .is_empty()
             .then_some(())
             .ok_or_else(|| fail("a missing slot should be a no-op merge"))
+    }
+
+    #[test]
+    fn parse_js_cookie_writes_preserves_max_age_attribute() -> Result<(), tauri_runtime::Error> {
+        // Set-Cookie-style single assignment with Max-Age=600 ->
+        // one cookie that carries the Max-Age (becomes Expires
+        // when merged via apply_max_age_as_expires).
+        let parsed = parse_js_cookie_writes(Some("session=abc; Max-Age=600"), "");
+        let first = parsed.first().ok_or_else(|| fail("expected one cookie"))?;
+        (parsed.len() == 1
+            && first.name() == "session"
+            && first.value() == "abc"
+            && first.max_age().is_some_and(|d| d == Duration::seconds(600)))
+        .then_some(())
+        .ok_or_else(|| fail("Max-Age attribute should be preserved on JS write"))
+    }
+
+    #[test]
+    fn parse_js_cookie_writes_preserves_path_attribute() -> Result<(), tauri_runtime::Error> {
+        let parsed = parse_js_cookie_writes(Some("scoped=ok; Path=/admin"), "");
+        let first = parsed.first().ok_or_else(|| fail("expected one cookie"))?;
+        (parsed.len() == 1
+            && first.name() == "scoped"
+            && first.path().is_some_and(|p| p == "/admin"))
+        .then_some(())
+        .ok_or_else(|| fail("Path attribute should be preserved on JS write"))
+    }
+
+    #[test]
+    fn parse_js_cookie_writes_preserves_secure_attribute() -> Result<(), tauri_runtime::Error> {
+        let parsed = parse_js_cookie_writes(Some("vip=ok; Secure"), "");
+        let first = parsed.first().ok_or_else(|| fail("expected one cookie"))?;
+        (parsed.len() == 1 && first.name() == "vip" && first.secure() == Some(true))
+            .then_some(())
+            .ok_or_else(|| fail("Secure flag should be preserved on JS write"))
+    }
+
+    #[test]
+    fn parse_js_cookie_writes_falls_back_to_split_for_plain_multi()
+    -> Result<(), tauri_runtime::Error> {
+        // No attributes anywhere -> v3.6 multi-entry fallback so
+        // "old=1; new=2" still merges as two cookies by name.
+        let parsed = parse_js_cookie_writes(Some("old=1; new=2"), "");
+        let names: Vec<String> = parsed.iter().map(|c| c.name().to_owned()).collect();
+        (parsed.len() == 2 && names.iter().any(|n| n == "old") && names.iter().any(|n| n == "new"))
+            .then_some(())
+            .ok_or_else(|| fail("plain multi-entry input should split into two cookies"))
+    }
+
+    #[test]
+    fn parse_js_cookie_writes_preserves_expires_attribute() -> Result<(), tauri_runtime::Error> {
+        // Use an HTTP-date-formatted Expires; parse should pick it
+        // up as an attribute so the single-cookie path wins.
+        let parsed = parse_js_cookie_writes(
+            Some("birthday=v; Expires=Wed, 01 Jan 2031 00:00:00 GMT"),
+            "",
+        );
+        let first = parsed.first().ok_or_else(|| fail("expected one cookie"))?;
+        (parsed.len() == 1 && first.name() == "birthday" && first.expires().is_some())
+            .then_some(())
+            .ok_or_else(|| fail("Expires attribute should be preserved on JS write"))
     }
 }
