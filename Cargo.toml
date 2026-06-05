@@ -1,8 +1,8 @@
 [package]
 name = "tauri-runtime-servocat"
-version = "3.6.0"
+version = "3.7.0"
 edition = "2024"
-description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.6.0 wires the v0.3 `web-api-cat::{set_document_cookie, get_document_cookie}` helpers into `WebviewState::eval`: before each script the JS-visible portion of the jar (non-`HttpOnly`, non-expired entries) is pushed into `document.cookie`; after the script, any JS write is parsed via `Cookie::split_parse` and merged back by name.  `HttpOnly` cookies are now hidden from `document.cookie` while still being sent on the wire (per RFC 6265 §5.2.6).  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
+description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.7.0 opts into net-cat v0.2's `tls` feature and broadens `try_http_url` to accept both `http://` and `https://`, so webview navigation can fetch real TLS-protected URLs; the v3.5 `Secure=` cookie filter that had been dropping every `Secure` entry now starts including them on `https://` requests.  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
 license = "MIT OR Apache-2.0"
 keywords = ["tauri", "runtime", "browser", "servo", "type-driven"]
 categories = ["gui", "rendering"]
@@ -13,7 +13,7 @@ css-cat = "0.1"
 dom-cat = "0.1"
 layout-cat = "0.1"
 paint-cat = "0.2"
-net-cat = "0.1"
+net-cat = { version = "0.2", features = ["tls"] }
 boa-cat = "0.2"
 ecma-runtime-cat = "0.1"
 web-api-cat = "0.3"

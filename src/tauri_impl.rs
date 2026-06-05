@@ -2316,10 +2316,12 @@ fn with_ipc_dispatch<T: UserEvent, R>(
 }
 
 /// Extract a usable HTML body from a URL plus any cookies the
-/// response set (only `http://` fetches return cookies; the other
-/// schemes return an empty `Vec`).  v2.2 closes the cookie loop:
-/// `http://` `Set-Cookie` headers are parsed via the `cookie` crate
-/// and returned for the caller to merge into the webview's jar.
+/// response set.  `data:` and `file://` schemes return an empty
+/// cookie `Vec`; `http://` and `https://` schemes go through
+/// `try_http_url` (which routes `https://` through net-cat's
+/// rustls path under the `tls` feature) and parse any `Set-Cookie`
+/// response headers via the `cookie` crate for the caller to merge
+/// into the webview's jar.
 fn html_from_url(url: &str, cookies: &[Cookie<'static>]) -> (String, Vec<Cookie<'static>>) {
     try_data_url(url)
         .map(|html| (html, Vec::new()))
@@ -2355,8 +2357,14 @@ fn try_file_url(url: &str) -> Option<String> {
 }
 
 fn try_http_url(url: &str, cookies: &[Cookie<'static>]) -> Option<(String, Vec<Cookie<'static>>)> {
+    // v3.7 accepts both `http://` and `https://`: net-cat's `tls`
+    // feature (enabled via Cargo.toml) routes the latter through
+    // rustls.  The `Secure=` cookie filter in `cookie_header_value`
+    // sees the real `parsed.scheme()`, so `Secure` cookies now
+    // actually traverse a TLS-protected wire when the request is
+    // `https://`.
     let parsed = url::Url::parse(url).ok()?;
-    (parsed.scheme() == "http").then_some(())?;
+    matches!(parsed.scheme(), "http" | "https").then_some(())?;
     let host = parsed.host_str().unwrap_or("");
     let path = parsed.path();
     let scheme = parsed.scheme();
