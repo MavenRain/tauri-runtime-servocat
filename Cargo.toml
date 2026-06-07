@@ -1,8 +1,8 @@
 [package]
 name = "tauri-runtime-servocat"
-version = "3.11.0"
+version = "3.12.0"
 edition = "2024"
-description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.11.0 picks up web-api-cat v0.4 (boa-cat 0.3 accessor-backed `document.cookie`) and retires the v3.8 `parse_js_cookie_writes` host heuristic: `WebviewState::eval` now consumes a per-write log (one entry per `document.cookie = \"...\"` statement, attributes intact) and parses each entry with `Cookie::parse`, so multi-write multi-attribute scripts merge correctly across `Max-Age` / `Expires` / `Path` / `Domain` / `Secure` / `HttpOnly` / `SameSite`."
+description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.12.0 bumps `ecma-parse-cat = \"0.1\"` to `\"0.2\"` and `ecma-runtime-cat = \"0.2\"` to `\"0.2.1\"`, then re-resolves boa-cat to 0.3.1: end-user webview scripts can now write `{ get x() {} }` / `{ set x(v) {} }` / `{ foo() {} }` accessor and shorthand-method object-literal syntax, and the engine dispatches getter/setter invocations through the same path that web-api-cat's Rust-installed `document.cookie` accessor uses."
 license = "MIT OR Apache-2.0"
 keywords = ["tauri", "runtime", "browser", "servo", "type-driven"]
 categories = ["gui", "rendering"]
@@ -18,7 +18,7 @@ boa-cat = "0.3"
 ecma-runtime-cat = "0.2"
 web-api-cat = "0.4"
 ecma-lex-cat = "0.1"
-ecma-parse-cat = "0.1"
+ecma-parse-cat = "0.2"
 tiny-skia = "0.12"
 cosmic-text = "0.19"
 winit = "0.30"

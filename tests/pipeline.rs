@@ -175,3 +175,47 @@ fn document_cookie_multiple_attribute_writes_log_in_order() -> Result<(), Error>
         .then_some(())
         .ok_or_else(|| fail("write log must keep order + attributes per entry"))
 }
+
+#[test]
+fn js_accessor_literal_dispatches_through_engine() -> Result<(), Error> {
+    // v3.12 picks up ecma-parse-cat 0.2 + boa-cat 0.3.1 so
+    // user-written `{ get x() {} }` / `{ set x(v) {} }` literal
+    // syntax reaches the engine's accessor-dispatch path that
+    // web-api-cat's `document.cookie` already uses internally.
+    // The script defines an inline accessor, writes through the
+    // setter, reads back through the getter, and proves the
+    // result reflects the setter's transformation -- end-to-end
+    // proof that parser -> engine accessor wiring is live.
+    let frame = run_script(
+        "<html></html>",
+        "",
+        "let backing = 0;
+        const o = {
+            get x() { return backing; },
+            set x(v) { backing = v * 3; }
+        };
+        o.x = 7;
+        o.x",
+        Viewport::new(400, 300),
+    )?;
+    matches!(frame.script_value(), Value::Number(n) if (n - 21.0).abs() < 1e-9)
+        .then_some(())
+        .ok_or_else(|| fail("inline accessor setter+getter should round-trip"))
+}
+
+#[test]
+fn js_shorthand_method_dispatches_through_engine() -> Result<(), Error> {
+    // Shorthand methods land as Method-kind AST members; the
+    // engine handles them identically to data properties holding
+    // a function value.  Calling `o.add(2, 3)` proves the bound
+    // function value is reachable through normal property access.
+    let frame = run_script(
+        "<html></html>",
+        "",
+        "const o = { add(a, b) { return a + b; } }; o.add(2, 3)",
+        Viewport::new(400, 300),
+    )?;
+    matches!(frame.script_value(), Value::Number(n) if (n - 5.0).abs() < 1e-9)
+        .then_some(())
+        .ok_or_else(|| fail("shorthand method should be callable"))
+}
