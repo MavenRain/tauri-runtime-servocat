@@ -2387,32 +2387,113 @@ fn try_file_url(url: &str) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
+/// Hard cap on redirect hops a single navigation attempt will
+/// follow.  Matches net-cat's `MAX_REDIRECTS` (10).
+const MAX_HTTP_REDIRECTS: u8 = 10;
+
 fn try_http_url(url: &str, cookies: &[Cookie<'static>]) -> Option<(String, Vec<Cookie<'static>>)> {
     // v3.7 accepts both `http://` and `https://`: net-cat's `tls`
     // feature (enabled via Cargo.toml) routes the latter through
-    // rustls.  The `Secure=` cookie filter in `cookie_header_value`
-    // sees the real `parsed.scheme()`, so `Secure` cookies now
-    // actually traverse a TLS-protected wire when the request is
-    // `https://`.
+    // rustls.
+    //
+    // v3.10 owns the redirect loop here instead of delegating to
+    // `net_cat::fetch`.  Each hop re-runs `cookie_header_value`
+    // against the hop's real `(scheme, host, path)`, so `Secure`
+    // / `Path=` / `Domain=` filters re-evaluate per hop -- a
+    // `Secure` cookie that was filtered out of an `http://` source
+    // request will correctly attach on an `https://` redirect
+    // target, and a `Path=/admin` cookie reaches a `/admin/...`
+    // redirect even when the source request was for `/`.
+    // Intermediate `Set-Cookie` headers fold into the working jar
+    // BEFORE the next hop is built, mirroring real-browser
+    // semantics.  All accumulated `Set-Cookie` entries
+    // (intermediate + terminal) surface in the returned `Vec` for
+    // the caller to merge into the webview's jar.
+    follow_http_hops(url, cookies.to_vec(), MAX_HTTP_REDIRECTS)
+}
+
+fn follow_http_hops(
+    url: &str,
+    jar: Vec<Cookie<'static>>,
+    hops_remaining: u8,
+) -> Option<(String, Vec<Cookie<'static>>)> {
     let parsed = url::Url::parse(url).ok()?;
     matches!(parsed.scheme(), "http" | "https").then_some(())?;
+    let response = single_http_hop(&parsed, &jar)?;
+    let hop_set_cookies = extract_set_cookies(&response);
+    redirect_target_url(&response, &parsed)
+        .filter(|_| hops_remaining > 0)
+        .map_or_else(
+            || Some((response.body_text(), hop_set_cookies.clone())),
+            |next_url| {
+                let next_jar = jar_with_set_cookies_merged(&jar, &hop_set_cookies);
+                follow_http_hops(next_url.as_str(), next_jar, hops_remaining - 1).map(
+                    |(html, downstream_set_cookies)| {
+                        let combined: Vec<Cookie<'static>> = hop_set_cookies
+                            .clone()
+                            .into_iter()
+                            .chain(downstream_set_cookies)
+                            .collect();
+                        (html, combined)
+                    },
+                )
+            },
+        )
+}
+
+fn single_http_hop(
+    parsed: &url::Url,
+    jar: &[Cookie<'static>],
+) -> Option<net_cat::response::Response> {
     let host = parsed.host_str().unwrap_or("");
     let path = parsed.path();
     let scheme = parsed.scheme();
-    let net_url = net_cat::url::Url::parse(url).ok()?;
+    let net_url = net_cat::url::Url::parse(parsed.as_str()).ok()?;
     let request = net_cat::request::Request::new(net_cat::method::Method::Get, net_url);
-    let request_with_cookies = cookie_header_value(cookies, host, path, scheme)
+    let request_with_cookies = cookie_header_value(jar, host, path, scheme)
         .into_iter()
         .fold(request, |req, header| req.with_header("Cookie", header));
-    let response = net_cat::fetch(&request_with_cookies).ok()?;
-    let parsed_cookies: Vec<Cookie<'static>> = response
+    net_cat::transport::exchange(&request_with_cookies).ok()
+}
+
+fn extract_set_cookies(response: &net_cat::response::Response) -> Vec<Cookie<'static>> {
+    response
         .headers()
         .iter()
         .filter(|(name, _value)| name.eq_ignore_ascii_case("Set-Cookie"))
         .filter_map(|(_name, value)| Cookie::parse(value.clone()).ok())
         .map(Cookie::into_owned)
-        .collect();
-    Some((response.body_text(), parsed_cookies))
+        .collect()
+}
+
+fn redirect_target_url(
+    response: &net_cat::response::Response,
+    current: &url::Url,
+) -> Option<url::Url> {
+    is_redirect_status(response.status())
+        .then(|| response.headers().get("location"))
+        .flatten()
+        .and_then(|location| current.join(location).ok())
+        .filter(|next| matches!(next.scheme(), "http" | "https"))
+}
+
+fn is_redirect_status(status: u16) -> bool {
+    matches!(status, 301..=303 | 307 | 308)
+}
+
+fn jar_with_set_cookies_merged(
+    jar: &[Cookie<'static>],
+    incoming: &[Cookie<'static>],
+) -> Vec<Cookie<'static>> {
+    // Reuse the existing `merge_cookies` (replace-by-name + expiry
+    // filter) by cloning into a fresh owned Vec.  The `mut` here is
+    // scoped to the local binding -- consistent with the existing
+    // `WebviewState::eval` pattern -- and lets the v3.3+ Max-Age
+    // rewrite + v3.2 expiry filter run on the intermediate
+    // `Set-Cookie` entries before the next hop reads the jar.
+    let mut next = jar.to_vec();
+    merge_cookies(&mut next, incoming.to_vec());
+    next
 }
 
 fn cookie_header_value(
@@ -3714,8 +3795,9 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
 #[cfg(test)]
 mod tests {
     use super::{
-        Cookie, cookie_header_value, cookie_is_expired, js_visible_cookie_string, merge_cookies,
-        parse_js_cookie_writes,
+        Cookie, cookie_header_value, cookie_is_expired, is_redirect_status,
+        jar_with_set_cookies_merged, js_visible_cookie_string, merge_cookies,
+        parse_js_cookie_writes, redirect_target_url,
     };
     use cookie::time::{Duration, OffsetDateTime};
 
@@ -4068,5 +4150,112 @@ mod tests {
         (parsed.len() == 1 && first.name() == "birthday" && first.expires().is_some())
             .then_some(())
             .ok_or_else(|| fail("Expires attribute should be preserved on JS write"))
+    }
+
+    #[test]
+    fn is_redirect_status_recognises_standard_codes() -> Result<(), tauri_runtime::Error> {
+        let positives = [301, 302, 303, 307, 308];
+        let negatives = [200, 204, 304, 400, 500];
+        (positives.iter().all(|s| is_redirect_status(*s))
+            && negatives.iter().all(|s| !is_redirect_status(*s)))
+        .then_some(())
+        .ok_or_else(|| fail("redirect status classification disagreed with RFC 7231"))
+    }
+
+    #[test]
+    fn redirect_target_url_resolves_absolute() -> Result<(), tauri_runtime::Error> {
+        let response = net_cat::response::Response::new(
+            302,
+            "Found",
+            net_cat::headers::Headers::new().with("Location", "https://b.example/next"),
+            Vec::new(),
+        );
+        let current =
+            url::Url::parse("http://a.example/").map_err(|_| fail("base url parse failed"))?;
+        let next = redirect_target_url(&response, &current)
+            .ok_or_else(|| fail("expected redirect target"))?;
+        (next.scheme() == "https" && next.host_str() == Some("b.example") && next.path() == "/next")
+            .then_some(())
+            .ok_or_else(|| fail("absolute Location should resolve verbatim"))
+    }
+
+    #[test]
+    fn redirect_target_url_resolves_relative() -> Result<(), tauri_runtime::Error> {
+        // v3.10 picks up `url::Url::join` so relative Location
+        // headers like "/admin/dashboard" resolve against the
+        // current URL's origin -- net-cat v0.3 alone returned
+        // `Error::InvalidUrl` for these.
+        let response = net_cat::response::Response::new(
+            301,
+            "Moved Permanently",
+            net_cat::headers::Headers::new().with("Location", "/admin/dashboard"),
+            Vec::new(),
+        );
+        let current =
+            url::Url::parse("http://a.example/start").map_err(|_| fail("base url parse failed"))?;
+        let next = redirect_target_url(&response, &current)
+            .ok_or_else(|| fail("expected redirect target"))?;
+        (next.host_str() == Some("a.example") && next.path() == "/admin/dashboard")
+            .then_some(())
+            .ok_or_else(|| fail("relative Location should resolve against current URL"))
+    }
+
+    #[test]
+    fn redirect_target_url_returns_none_on_2xx() -> Result<(), tauri_runtime::Error> {
+        let response = net_cat::response::Response::new(
+            200,
+            "OK",
+            net_cat::headers::Headers::new().with("Location", "https://b.example/"),
+            Vec::new(),
+        );
+        let current =
+            url::Url::parse("http://a.example/").map_err(|_| fail("base url parse failed"))?;
+        redirect_target_url(&response, &current)
+            .is_none()
+            .then_some(())
+            .ok_or_else(|| fail("non-redirect status should yield no target"))
+    }
+
+    #[test]
+    fn redirect_target_url_rejects_non_http_target() -> Result<(), tauri_runtime::Error> {
+        // Defense-in-depth: a server that sends `Location:
+        // javascript:alert(1)` or `file:///etc/passwd` should be
+        // refused at the URL filter even if status + Location are
+        // both well-formed.
+        let response = net_cat::response::Response::new(
+            302,
+            "Found",
+            net_cat::headers::Headers::new().with("Location", "javascript:alert(1)"),
+            Vec::new(),
+        );
+        let current =
+            url::Url::parse("http://a.example/").map_err(|_| fail("base url parse failed"))?;
+        redirect_target_url(&response, &current)
+            .is_none()
+            .then_some(())
+            .ok_or_else(|| fail("non-http/https redirect targets must be refused"))
+    }
+
+    #[test]
+    fn jar_with_set_cookies_merged_replaces_by_name() -> Result<(), tauri_runtime::Error> {
+        let jar = vec![Cookie::build(("session", "old")).build()];
+        let incoming = vec![Cookie::build(("session", "new")).build()];
+        let result = jar_with_set_cookies_merged(&jar, &incoming);
+        let first = result.first().ok_or_else(|| fail("expected merged jar"))?;
+        (result.len() == 1 && first.value() == "new")
+            .then_some(())
+            .ok_or_else(|| fail("intermediate Set-Cookie should replace existing entry"))
+    }
+
+    #[test]
+    fn jar_with_set_cookies_merged_preserves_input() -> Result<(), tauri_runtime::Error> {
+        // The non-mutating merge must not mutate its input slice.
+        let jar = vec![Cookie::build(("a", "1")).build()];
+        let incoming = vec![Cookie::build(("b", "2")).build()];
+        let _ = jar_with_set_cookies_merged(&jar, &incoming);
+        let first = jar.first().ok_or_else(|| fail("input vanished"))?;
+        (jar.len() == 1 && first.name() == "a" && first.value() == "1")
+            .then_some(())
+            .ok_or_else(|| fail("non-mutating merge must leave the source jar untouched"))
     }
 }

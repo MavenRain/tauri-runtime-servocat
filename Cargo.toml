@@ -1,8 +1,8 @@
 [package]
 name = "tauri-runtime-servocat"
-version = "3.9.0"
+version = "3.10.0"
 edition = "2024"
-description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.9.0 picks up net-cat v0.3 so webview navigation transparently follows `Location:` redirect chains (RFC 7231 §6.4 method-downgrade + cross-origin credential stripping, capped at 10 hops) and decodes `Transfer-Encoding: chunked` response bodies (common over TLS-terminated CDNs).  No consumer-side wiring change beyond the version bump -- `try_http_url` calls `net_cat::fetch` which already gives back the decoded body of the final hop.  The Servo no-AI policy disqualifies upstream contribution; this is the AI-built parallel."
+description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.10.0 owns the redirect loop in `try_http_url` (uses `net_cat::transport::exchange` directly): each hop re-runs `cookie_header_value` against the hop's real `(scheme, host, path)` so `Secure` / `Path=` / `Domain=` filters re-evaluate per hop, and intermediate `Set-Cookie` headers fold into the working jar before the next hop's `Cookie:` header is built.  Relative `Location` URLs resolve against the current URL via `url::Url::join`."
 license = "MIT OR Apache-2.0"
 keywords = ["tauri", "runtime", "browser", "servo", "type-driven"]
 categories = ["gui", "rendering"]
