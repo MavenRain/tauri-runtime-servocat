@@ -1,8 +1,8 @@
 [package]
 name = "tauri-runtime-servocat"
-version = "3.12.0"
+version = "3.13.0"
 edition = "2024"
-description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.12.0 bumps `ecma-parse-cat = \"0.1\"` to `\"0.2\"` and `ecma-runtime-cat = \"0.2\"` to `\"0.2.1\"`, then re-resolves boa-cat to 0.3.1: end-user webview scripts can now write `{ get x() {} }` / `{ set x(v) {} }` / `{ foo() {} }` accessor and shorthand-method object-literal syntax, and the engine dispatches getter/setter invocations through the same path that web-api-cat's Rust-installed `document.cookie` accessor uses."
+description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.13.0 closes redraw + relayout gaps in `WebviewState` mutations during the event loop: `SetWebviewBounds`, `SetWebviewSize`, `SetWebviewPosition`, `SetWebviewBackgroundColor`, and the `auto_resize` branch of `WinitWindowEvent::Resized` now all call `request_redraw_for_webview`, and the bounds/size paths additionally rebuild the layout viewport via a new `WebviewState::resize(viewport)` + `viewport_from_size(size, scale_factor)` pair so the new dimensions reach the display list, not just the stored bounds rect."
 license = "MIT OR Apache-2.0"
 keywords = ["tauri", "runtime", "browser", "servo", "type-driven"]
 categories = ["gui", "rendering"]

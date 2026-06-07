@@ -2240,6 +2240,16 @@ impl<T: UserEvent> WebviewState<T> {
         self.current_frame = crate::pipeline::render(&self.html, &self.css, self.viewport).ok();
     }
 
+    /// v3.13: swap the layout viewport and re-run the pipeline.
+    /// Callers (`SetWebviewBounds` / `SetWebviewSize` and the
+    /// `auto_resize` branch of `WinitWindowEvent::Resized`) pair this
+    /// with `request_redraw_for_webview` so the new layout reaches
+    /// the screen.
+    fn resize(&mut self, viewport: Viewport) {
+        self.viewport = viewport;
+        self.rebuild_frame();
+    }
+
     fn eval(&mut self, script: &str) -> Option<String> {
         // v3.6 introduced the JS-visible jar projection (drop
         // `HttpOnly` and expired per RFC 6265 §5.2.6 / §5.3).
@@ -2275,6 +2285,15 @@ impl<T: UserEvent> WebviewState<T> {
 /// Serialize the JS-visible portion of `jar` as a single
 /// `name1=value1; name2=value2` string for `document.cookie`.
 /// `HttpOnly` and already-expired entries are excluded.
+/// v3.13: convert a `tauri_runtime::dpi::Size` (Physical or
+/// Logical, since the public `SetWebviewBounds` / `SetWebviewSize`
+/// API accepts either) into the engine's layout `Viewport` in
+/// physical pixels at the supplied scale factor.
+fn viewport_from_size(size: tauri_runtime::dpi::Size, scale_factor: f64) -> Viewport {
+    let physical: PhysicalSize<u32> = size.to_physical(scale_factor);
+    Viewport::new(physical.width, physical.height)
+}
+
 fn js_visible_cookie_string(jar: &[Cookie<'static>]) -> String {
     let now = cookie::time::OffsetDateTime::now_utc();
     jar.iter()
@@ -2723,6 +2742,17 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> AppHandler<T, F> {
         let _ = self
             .parent_window_of(webview_raw)
             .map(|window_raw| self.request_redraw(window_raw));
+    }
+
+    /// v3.13: look up the parent window's `HiDPI` scale factor so a
+    /// `tauri_runtime::dpi::Size` (Physical OR Logical) can be
+    /// converted to the engine's layout-level `Viewport` in
+    /// physical pixels.  Defaults to 1.0 when the webview has no
+    /// associated window yet.
+    fn webview_parent_scale_factor(&self, webview_raw: u32) -> f64 {
+        self.parent_window_of(webview_raw)
+            .and_then(|window_raw| self.windows.get(&window_raw))
+            .map_or(1.0, winit::window::Window::scale_factor)
     }
 
     fn present(&mut self, window_raw: u32) {
@@ -3483,18 +3513,26 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
             }
             RuntimeEvent::SetWebviewBounds { webview_id, bounds } => {
                 let raw = webview_id.raw();
+                let scale_factor = self.webview_parent_scale_factor(raw);
+                let new_viewport = viewport_from_size(bounds.size, scale_factor);
                 let _ = self.webviews.get_mut(&raw).map(|webview| {
                     webview.bounds = bounds;
+                    webview.resize(new_viewport);
                 });
+                self.request_redraw_for_webview(raw);
             }
             RuntimeEvent::SetWebviewSize { webview_id, size } => {
                 let raw = webview_id.raw();
+                let scale_factor = self.webview_parent_scale_factor(raw);
+                let new_viewport = viewport_from_size(size, scale_factor);
                 let _ = self.webviews.get_mut(&raw).map(|webview| {
                     webview.bounds = Rect {
                         position: webview.bounds.position,
                         size,
                     };
+                    webview.resize(new_viewport);
                 });
+                self.request_redraw_for_webview(raw);
             }
             RuntimeEvent::SetWebviewPosition {
                 webview_id,
@@ -3507,6 +3545,7 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                         size: webview.bounds.size,
                     };
                 });
+                self.request_redraw_for_webview(raw);
             }
             RuntimeEvent::QueryWebviewBounds { webview_id, reply } => {
                 let raw = webview_id.raw();
@@ -3548,6 +3587,7 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                 let _ = self.webviews.get_mut(&raw).map(|webview| {
                     webview.background_color = color;
                 });
+                self.request_redraw_for_webview(raw);
             }
             RuntimeEvent::SetWebviewAutoResize {
                 webview_id,
@@ -3708,6 +3748,10 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                         TauriWindowEvent::Resized(PhysicalSize::new(size.width, size.height)),
                     );
                     let webview_raw = self.window_to_webview.get(&raw).copied();
+                    // v3.13: when `auto_resize` is on, the webview
+                    // also re-runs layout at the new size so the
+                    // RedrawRequested winit will fire next renders
+                    // the fresh display list.
                     let _ = webview_raw
                         .and_then(|wv| self.webviews.get_mut(&wv))
                         .map(|webview| {
@@ -3719,6 +3763,7 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
                                         size.height,
                                     )),
                                 };
+                                webview.resize(Viewport::new(size.width, size.height));
                             }
                         });
                 });
@@ -3775,7 +3820,7 @@ mod tests {
     use super::{
         Cookie, cookie_header_value, cookie_is_expired, is_redirect_status,
         jar_with_set_cookies_merged, js_visible_cookie_string, merge_cookies,
-        parse_cookie_write_log, redirect_target_url,
+        parse_cookie_write_log, redirect_target_url, viewport_from_size,
     };
     use cookie::time::{Duration, OffsetDateTime};
 
@@ -4217,5 +4262,37 @@ mod tests {
         (jar.len() == 1 && first.name() == "a" && first.value() == "1")
             .then_some(())
             .ok_or_else(|| fail("non-mutating merge must leave the source jar untouched"))
+    }
+
+    #[test]
+    fn viewport_from_physical_size_preserves_dimensions() -> Result<(), tauri_runtime::Error> {
+        let size = tauri_runtime::dpi::Size::Physical(super::PhysicalSize::new(1024, 768));
+        let viewport = viewport_from_size(size, 1.0);
+        (viewport.width() == 1024 && viewport.height() == 768)
+            .then_some(())
+            .ok_or_else(|| fail("physical size should round-trip unchanged at scale 1"))
+    }
+
+    #[test]
+    fn viewport_from_logical_size_scales_to_physical() -> Result<(), tauri_runtime::Error> {
+        // 400x300 logical pixels at scale 2.0 -> 800x600 physical.
+        let size = tauri_runtime::dpi::Size::Logical(tauri_runtime::dpi::LogicalSize::new(
+            400.0_f64, 300.0_f64,
+        ));
+        let viewport = viewport_from_size(size, 2.0);
+        (viewport.width() == 800 && viewport.height() == 600)
+            .then_some(())
+            .ok_or_else(|| fail("logical size should multiply by scale factor"))
+    }
+
+    #[test]
+    fn viewport_from_logical_size_unit_scale_round_trips() -> Result<(), tauri_runtime::Error> {
+        let size = tauri_runtime::dpi::Size::Logical(tauri_runtime::dpi::LogicalSize::new(
+            800.0_f64, 600.0_f64,
+        ));
+        let viewport = viewport_from_size(size, 1.0);
+        (viewport.width() == 800 && viewport.height() == 600)
+            .then_some(())
+            .ok_or_else(|| fail("logical size at scale 1 should match its numeric dimensions"))
     }
 }
