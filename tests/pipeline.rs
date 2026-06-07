@@ -130,7 +130,7 @@ fn run_script_layout_still_produced() -> Result<(), Error> {
 
 #[test]
 fn document_cookie_seeded_value_visible_to_js() -> Result<(), Error> {
-    let (frame, _post) = run_script_with_cookies(
+    let (frame, _writes) = run_script_with_cookies(
         "<html></html>",
         "",
         "document.cookie",
@@ -144,17 +144,34 @@ fn document_cookie_seeded_value_visible_to_js() -> Result<(), Error> {
 }
 
 #[test]
-fn document_cookie_js_write_reaches_post_eval() -> Result<(), Error> {
-    let (_frame, post) = run_script_with_cookies(
+fn document_cookie_js_write_reaches_write_log() -> Result<(), Error> {
+    // v3.11: writes surface as a per-write log (one entry per
+    // `document.cookie = "..."` statement, attributes intact)
+    // instead of one post-eval string.
+    let (_frame, writes) = run_script_with_cookies(
         "<html></html>",
         "",
-        "document.cookie = 'theme=dark'; document.cookie",
+        "document.cookie = 'theme=dark'",
         Viewport::new(400, 300),
         &HostCommands::new(),
         "",
     )?;
-    post.as_deref()
-        .filter(|s| *s == "theme=dark")
-        .map(|_| ())
-        .ok_or_else(|| fail("post-eval slot should carry the JS-written value"))
+    (writes == vec!["theme=dark".to_owned()])
+        .then_some(())
+        .ok_or_else(|| fail("write log should carry the JS-written value"))
+}
+
+#[test]
+fn document_cookie_multiple_attribute_writes_log_in_order() -> Result<(), Error> {
+    let (_frame, writes) = run_script_with_cookies(
+        "<html></html>",
+        "",
+        "document.cookie = 'a=1; Path=/'; document.cookie = 'b=2; Max-Age=600'",
+        Viewport::new(400, 300),
+        &HostCommands::new(),
+        "",
+    )?;
+    (writes == vec!["a=1; Path=/".to_owned(), "b=2; Max-Age=600".to_owned()])
+        .then_some(())
+        .ok_or_else(|| fail("write log must keep order + attributes per entry"))
 }

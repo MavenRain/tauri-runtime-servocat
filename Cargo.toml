@@ -1,8 +1,8 @@
 [package]
 name = "tauri-runtime-servocat"
-version = "3.10.0"
+version = "3.11.0"
 edition = "2024"
-description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.10.0 owns the redirect loop in `try_http_url` (uses `net_cat::transport::exchange` directly): each hop re-runs `cookie_header_value` against the hop's real `(scheme, host, path)` so `Secure` / `Path=` / `Domain=` filters re-evaluate per hop, and intermediate `Set-Cookie` headers fold into the working jar before the next hop's `Cookie:` header is built.  Relative `Location` URLs resolve against the current URL via `url::Url::join`."
+description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.11.0 picks up web-api-cat v0.4 (boa-cat 0.3 accessor-backed `document.cookie`) and retires the v3.8 `parse_js_cookie_writes` host heuristic: `WebviewState::eval` now consumes a per-write log (one entry per `document.cookie = \"...\"` statement, attributes intact) and parses each entry with `Cookie::parse`, so multi-write multi-attribute scripts merge correctly across `Max-Age` / `Expires` / `Path` / `Domain` / `Secure` / `HttpOnly` / `SameSite`."
 license = "MIT OR Apache-2.0"
 keywords = ["tauri", "runtime", "browser", "servo", "type-driven"]
 categories = ["gui", "rendering"]
@@ -14,9 +14,9 @@ dom-cat = "0.1"
 layout-cat = "0.1"
 paint-cat = "0.2"
 net-cat = { version = "0.3", features = ["tls"] }
-boa-cat = "0.2"
-ecma-runtime-cat = "0.1"
-web-api-cat = "0.3"
+boa-cat = "0.3"
+ecma-runtime-cat = "0.2"
+web-api-cat = "0.4"
 ecma-lex-cat = "0.1"
 ecma-parse-cat = "0.1"
 tiny-skia = "0.12"

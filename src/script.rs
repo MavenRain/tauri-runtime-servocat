@@ -101,20 +101,23 @@ pub fn run_script_with_backprop(
     commands: &HostCommands,
 ) -> Result<Frame, Error> {
     run_script_with_cookies(html_source, css_source, js_source, viewport, commands, "")
-        .map(|(frame, _post_eval)| frame)
+        .map(|(frame, _writes)| frame)
 }
 
-/// Variant of [`run_script_with_backprop`] that also synchronizes a
-/// cookie string in and out of `document.cookie`.  `cookie_string`
-/// is pushed into `document.cookie` via
-/// [`web_api_cat::set_document_cookie`] before the JS step, and the
-/// post-script value of `document.cookie` is returned alongside the
-/// frame so the caller can parse + merge any writes JS made.
+/// Variant of [`run_script_with_backprop`] that synchronizes a
+/// cookie string in / a per-write log out of `document.cookie`.
+/// `cookie_string` is pushed into `document.cookie` via
+/// [`web_api_cat::set_document_cookie`] before the JS step (which
+/// also clears the v0.4 hidden write log), and the post-script
+/// write log is returned alongside the frame as a
+/// `Vec<String>`: one entry per `document.cookie = "..."` write
+/// inside the script, in write order, with attributes intact (e.g.
+/// `"name=v; Max-Age=600; Path=/admin"`).  The caller parses each
+/// entry with `cookie::Cookie::parse` and merges by name.
 ///
 /// The caller is responsible for the JS-visibility filter on
-/// `cookie_string` (e.g. dropping `HttpOnly` entries) and for parsing
-/// the post-eval string back into cookie objects.  This function
-/// only shuttles strings.
+/// `cookie_string` (e.g. dropping `HttpOnly` entries) and for
+/// parsing the per-write entries back into cookie objects.
 ///
 /// # Errors
 ///
@@ -126,13 +129,13 @@ pub fn run_script_with_cookies(
     viewport: Viewport,
     commands: &HostCommands,
     cookie_string: &str,
-) -> Result<(Frame, Option<String>), Error> {
+) -> Result<(Frame, Vec<String>), Error> {
     let prepared = prepare(html_source, css_source, viewport, commands)?;
     let document_value = prepared.document_value.clone();
     let stylesheet = prepared.stylesheet.clone();
     let heap = web_api_cat::set_document_cookie(&document_value, prepared.heap, cookie_string);
     let (value, heap) = evaluate(js_source, prepared.env, heap)?;
-    let post_eval = web_api_cat::get_document_cookie(&document_value, &heap);
+    let cookie_writes = web_api_cat::read_cookie_writes(&document_value, &heap);
     let (dom, layout_tree, display_list) = extract_document(&document_value, &heap)
         .map(|extracted_dom| {
             let new_layout = layout_cat::layout(&extracted_dom, &stylesheet, viewport);
@@ -142,7 +145,7 @@ pub fn run_script_with_cookies(
         .unwrap_or((prepared.dom, prepared.layout_tree, prepared.display_list));
     Ok((
         Frame::new(dom, layout_tree, display_list, value, heap),
-        post_eval,
+        cookie_writes,
     ))
 }
 
