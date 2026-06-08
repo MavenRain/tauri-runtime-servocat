@@ -146,3 +146,52 @@ fn backprop_falls_back_when_no_mutation() -> Result<(), Error> {
         .then_some(())
         .ok_or_else(|| fail("expected non-empty display list with no-op script"))
 }
+
+#[test]
+fn host_command_invoked_via_global_invoke() -> Result<(), Error> {
+    // v3.14: top-level `invoke(cmd, ...args)` dispatches through the
+    // thread-local registry, no `this` required.
+    let commands = HostCommands::new().with("shout", echo_upper);
+    let frame = run_script_with_commands(
+        "<html><body></body></html>",
+        "",
+        "invoke('shout', 'hi')",
+        Viewport::new(100, 100),
+        &commands,
+    )?;
+    matches!(frame.script_value(), Value::String(s) if s == "HI")
+        .then_some(())
+        .ok_or_else(|| fail("expected 'HI' from global invoke"))
+}
+
+#[test]
+fn global_invoke_survives_being_rebound_to_a_variable() -> Result<(), Error> {
+    // The whole reason for v3.14: `const i = invoke; i(...)` should
+    // still dispatch even though `this` is no longer __TAURI__.
+    let commands = HostCommands::new().with("add", add);
+    let frame = run_script_with_commands(
+        "<html><body></body></html>",
+        "",
+        "const i = invoke; i('add', 2, 3, 5)",
+        Viewport::new(100, 100),
+        &commands,
+    )?;
+    matches!(frame.script_value(), Value::Number(n) if (*n - 10.0).abs() < 1e-9)
+        .then_some(())
+        .ok_or_else(|| fail("rebound invoke should still hit the registry"))
+}
+
+#[test]
+fn global_invoke_unknown_command_returns_null() -> Result<(), Error> {
+    let commands = HostCommands::new();
+    let frame = run_script_with_commands(
+        "<html><body></body></html>",
+        "",
+        "invoke('missing', 1)",
+        Viewport::new(100, 100),
+        &commands,
+    )?;
+    matches!(frame.script_value(), Value::Null)
+        .then_some(())
+        .ok_or_else(|| fail("unknown command via global invoke should yield null"))
+}

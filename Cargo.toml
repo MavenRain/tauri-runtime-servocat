@@ -1,8 +1,8 @@
 [package]
 name = "tauri-runtime-servocat"
-version = "3.13.0"
+version = "3.14.0"
 edition = "2024"
-description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.13.0 closes redraw + relayout gaps in `WebviewState` mutations during the event loop: `SetWebviewBounds`, `SetWebviewSize`, `SetWebviewPosition`, `SetWebviewBackgroundColor`, and the `auto_resize` branch of `WinitWindowEvent::Resized` now all call `request_redraw_for_webview`, and the bounds/size paths additionally rebuild the layout viewport via a new `WebviewState::resize(viewport)` + `viewport_from_size(size, scale_factor)` pair so the new dimensions reach the display list, not just the stored bounds rect."
+description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.14.0 adds a globally-bound `invoke(cmd, ...args)` shorthand alongside the existing `__TAURI__.invoke` / `__TAURI__.cmd(...)` paths: `HostCommands::install` snapshots the registry into a per-thread `INVOKE_REGISTRY` and installs a top-level `invoke` `NativeFn` that dispatches via the snapshot, so `invoke('greet', 'x')` and `const i = invoke; i('greet', 'x')` both work without a `this` binding."
 license = "MIT OR Apache-2.0"
 keywords = ["tauri", "runtime", "browser", "servo", "type-driven"]
 categories = ["gui", "rendering"]
