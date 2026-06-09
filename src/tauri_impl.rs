@@ -2136,7 +2136,8 @@ fn post_ipc_message_impl(args: Vec<Value>, _this: Value, heap: BoaHeap, fuel: Fu
         | Value::Number(_)
         | Value::Object(_)
         | Value::Function(_)
-        | Value::Native(_) => format!("{value}"),
+        | Value::Native(_)
+        | Value::Promise(_) => format!("{value}"),
     });
     let _ = http::Request::builder()
         .uri("ipc://post-message")

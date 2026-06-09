@@ -138,7 +138,8 @@ fn first_string_arg(args: &[Value]) -> String {
             | Value::Number(_)
             | Value::Object(_)
             | Value::Function(_)
-            | Value::Native(_) => None,
+            | Value::Native(_)
+            | Value::Promise(_) => None,
         })
         .unwrap_or_default()
 }
@@ -162,7 +163,8 @@ fn invoke_impl(args: Vec<Value>, this: Value, heap: Heap, fuel: Fuel) -> EvalRes
         | Value::Number(_)
         | Value::String(_)
         | Value::Function(_)
-        | Value::Native(_) => None,
+        | Value::Native(_)
+        | Value::Promise(_) => None,
     };
     let command_fn = this_id
         .and_then(|id| heap.object(id))
@@ -175,7 +177,8 @@ fn invoke_impl(args: Vec<Value>, this: Value, heap: Heap, fuel: Fuel) -> EvalRes
             | Value::Number(_)
             | Value::String(_)
             | Value::Object(_)
-            | Value::Function(_) => None,
+            | Value::Function(_)
+            | Value::Promise(_) => None,
         });
     let forwarded: Vec<Value> = args.into_iter().skip(1).collect();
     command_fn.map_or(

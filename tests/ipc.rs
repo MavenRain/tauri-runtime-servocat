@@ -1,5 +1,6 @@
 //! v0.5 integration tests: host command invocation + DOM back-prop.
 
+use boa_cat::PromiseState;
 use boa_cat::Value;
 use boa_cat::fuel::Fuel;
 use boa_cat::heap::Heap;
@@ -25,7 +26,8 @@ fn echo_upper(args: Vec<Value>, _this: Value, heap: Heap, fuel: Fuel) -> EvalRes
             | Value::Number(_)
             | Value::Object(_)
             | Value::Function(_)
-            | Value::Native(_) => None,
+            | Value::Native(_)
+            | Value::Promise(_) => None,
         })
         .unwrap_or_default();
     let upper = text.to_uppercase();
@@ -44,7 +46,8 @@ fn add(args: Vec<Value>, _this: Value, heap: Heap, fuel: Fuel) -> EvalResult {
             | Value::String(_)
             | Value::Object(_)
             | Value::Function(_)
-            | Value::Native(_) => None,
+            | Value::Native(_)
+            | Value::Promise(_) => None,
         })
         .sum();
     Ok((Outcome::Normal(Value::Number(total)), heap, fuel))
@@ -194,4 +197,78 @@ fn global_invoke_unknown_command_returns_null() -> Result<(), Error> {
     matches!(frame.script_value(), Value::Null)
         .then_some(())
         .ok_or_else(|| fail("unknown command via global invoke should yield null"))
+}
+
+// v3.15: end-to-end async-host-command test.  A `NativeFn`
+// allocates a `Resolved(value)` promise from Rust and returns
+// `Value::Promise(id)`; JS calls `invoke('cmd', arg)` to reach
+// the command, wraps the result with `Promise.resolve` (no-op
+// short-circuit since the value is already a Promise), and
+// `await`s inside an async function.  The unwrapped value reaches
+// the outer captured variable through `.then`.
+
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+fn async_double(args: Vec<Value>, _this: Value, heap: Heap, fuel: Fuel) -> EvalResult {
+    let n = match args.first() {
+        Some(Value::Number(n)) => *n,
+        Some(_) | None => 0.0,
+    };
+    let (id, heap) = heap.alloc_promise(PromiseState::Resolved(Value::Number(n * 2.0)));
+    Ok((Outcome::Normal(Value::Promise(id)), heap, fuel))
+}
+
+#[test]
+fn host_command_returning_promise_is_awaitable() -> Result<(), Error> {
+    let commands = HostCommands::new().with("async_double", async_double);
+    let frame = run_script_with_commands(
+        "<html><body></body></html>",
+        "",
+        "let captured = -1;
+        (async function () {
+            const v = await invoke('async_double', 21);
+            captured = v;
+        })();
+        captured",
+        Viewport::new(100, 100),
+        &commands,
+    )?;
+    matches!(frame.script_value(), Value::Number(n) if (n - 42.0).abs() < 1e-9)
+        .then_some(())
+        .ok_or_else(|| fail("expected 42 from await invoke('async_double', 21)"))
+}
+
+#[test]
+fn host_command_promise_works_through_promise_dot_then() -> Result<(), Error> {
+    let commands = HostCommands::new().with("async_double", async_double);
+    let frame = run_script_with_commands(
+        "<html><body></body></html>",
+        "",
+        "let captured = -1;
+        invoke('async_double', 5).then(v => { captured = v; });
+        captured",
+        Viewport::new(100, 100),
+        &commands,
+    )?;
+    matches!(frame.script_value(), Value::Number(n) if (n - 10.0).abs() < 1e-9)
+        .then_some(())
+        .ok_or_else(|| fail("expected 10 from invoke('async_double', 5).then(cb)"))
+}
+
+#[test]
+fn host_command_promise_composes_with_promise_all() -> Result<(), Error> {
+    let commands = HostCommands::new().with("async_double", async_double);
+    let frame = run_script_with_commands(
+        "<html><body></body></html>",
+        "",
+        "let captured = -1;
+        Promise.all([invoke('async_double', 3), invoke('async_double', 4)]).then(arr => {
+            captured = arr[0] + arr[1];
+        });
+        captured",
+        Viewport::new(100, 100),
+        &commands,
+    )?;
+    matches!(frame.script_value(), Value::Number(n) if (n - 14.0).abs() < 1e-9)
+        .then_some(())
+        .ok_or_else(|| fail("expected 14 from Promise.all([6, 8]) sum"))
 }

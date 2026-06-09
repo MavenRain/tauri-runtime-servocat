@@ -1,8 +1,8 @@
 [package]
 name = "tauri-runtime-servocat"
-version = "3.14.0"
+version = "3.15.0"
 edition = "2024"
-description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.14.0 adds a globally-bound `invoke(cmd, ...args)` shorthand alongside the existing `__TAURI__.invoke` / `__TAURI__.cmd(...)` paths: `HostCommands::install` snapshots the registry into a per-thread `INVOKE_REGISTRY` and installs a top-level `invoke` `NativeFn` that dispatches via the snapshot, so `invoke('greet', 'x')` and `const i = invoke; i('greet', 'x')` both work without a `this` binding."
+description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.15.0 closes the async arc end-to-end: bumps to boa-cat 0.6 (Promise type + microtask driver + `await` evaluator) + ecma-runtime-cat 0.3 (`Promise.{resolve,reject,all,race}` global) + web-api-cat 0.5, and proves the wiring with an end-to-end test that has a `HostCommands` callback return a `Value::Promise` and a JS script `await invoke('cmd', ...)` to unwrap it.  The existing `NativeFn` host-command surface is unchanged -- promises returned from commands now compose naturally with `.then` / `await` / `Promise.all` through the engine's dispatch path."
 license = "MIT OR Apache-2.0"
 keywords = ["tauri", "runtime", "browser", "servo", "type-driven"]
 categories = ["gui", "rendering"]
@@ -14,9 +14,9 @@ dom-cat = "0.1"
 layout-cat = "0.1"
 paint-cat = "0.2"
 net-cat = { version = "0.3", features = ["tls"] }
-boa-cat = "0.3"
-ecma-runtime-cat = "0.2"
-web-api-cat = "0.4"
+boa-cat = "0.6"
+ecma-runtime-cat = "0.3"
+web-api-cat = "0.5"
 ecma-lex-cat = "0.1"
 ecma-parse-cat = "0.2"
 tiny-skia = "0.12"
