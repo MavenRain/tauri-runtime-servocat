@@ -272,3 +272,52 @@ fn host_command_promise_composes_with_promise_all() -> Result<(), Error> {
         .then_some(())
         .ok_or_else(|| fail("expected 14 from Promise.all([6, 8]) sum"))
 }
+
+#[test]
+fn host_command_awaited_via_natural_async_arrow_syntax() -> Result<(), Error> {
+    // v3.16: ecma-parse-cat 0.3 (via boa-cat 0.7) lets webview
+    // scripts use `async () => body` arrow syntax and `.catch(cb)`
+    // dot-member access without the (async function () { ... })()
+    // / .then(null, cb) workarounds from v3.15.
+    let commands = HostCommands::new().with("async_double", async_double);
+    let frame = run_script_with_commands(
+        "<html><body></body></html>",
+        "",
+        "let captured = -1;
+        (async () => {
+            const v = await invoke('async_double', 21);
+            captured = v;
+        })();
+        captured",
+        Viewport::new(100, 100),
+        &commands,
+    )?;
+    matches!(frame.script_value(), Value::Number(n) if (n - 42.0).abs() < 1e-9)
+        .then_some(())
+        .ok_or_else(|| fail("expected 42 from async-arrow IIFE awaiting invoke"))
+}
+
+#[test]
+fn host_command_promise_rejection_caught_via_catch_member_access() -> Result<(), Error> {
+    // v3.16 sanity check that reserved-word member access (`.catch`)
+    // parses in user scripts.
+    let commands = HostCommands::new().with("bad", reject_with_message);
+    let frame = run_script_with_commands(
+        "<html><body></body></html>",
+        "",
+        "let caught = '';
+        invoke('bad').catch(e => { caught = e; });
+        caught",
+        Viewport::new(100, 100),
+        &commands,
+    )?;
+    matches!(frame.script_value(), Value::String(s) if s == "boom")
+        .then_some(())
+        .ok_or_else(|| fail("expected 'boom' caught via .catch(cb)"))
+}
+
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+fn reject_with_message(_args: Vec<Value>, _this: Value, heap: Heap, fuel: Fuel) -> EvalResult {
+    let (id, heap) = heap.alloc_promise(PromiseState::Rejected(Value::String("boom".to_owned())));
+    Ok((Outcome::Normal(Value::Promise(id)), heap, fuel))
+}
