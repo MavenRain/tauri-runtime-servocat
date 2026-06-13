@@ -314,6 +314,46 @@ fn event_stop_propagation_halts_bubble_through_runtime() -> Result<(), Error> {
 }
 
 #[test]
+fn event_capture_phase_fires_before_target_through_runtime() -> Result<(), Error> {
+    // v3.21 surface check: web-api-cat 0.7.6 capture-phase
+    // listeners reach scripts via run_script.  A parent
+    // capture listener should fire BEFORE the child's
+    // target listener.
+    let frame = run_script(
+        "<html><body><div id='parent'><span id='child'>x</span></div></body></html>",
+        "",
+        "let trace = '';
+        const child = document.getElementById('child');
+        const parent = document.getElementById('parent');
+        parent.addEventListener('click', () => { trace = trace + 'pc'; }, true);
+        child.addEventListener('click', () => { trace = trace + 'c'; });
+        child.dispatchEvent({ type: 'click' });
+        trace",
+        Viewport::new(400, 300),
+    )?;
+    matches!(frame.script_value(), Value::String(s) if s == "pcc")
+        .then_some(())
+        .ok_or_else(|| fail("expected capture phase before target listener (pcc)"))
+}
+
+#[test]
+fn dataset_camelcase_read_through_runtime() -> Result<(), Error> {
+    // v3.21 surface check: web-api-cat 0.7.7 dataset.
+    // `<div data-user-name='alice'>` should expose
+    // `el.dataset.userName === 'alice'` to scripts.
+    let frame = run_script(
+        "<html><body><div id='host' data-user-name='alice' data-user-profile-id='42'></div></body></html>",
+        "",
+        "const host = document.getElementById('host');
+        host.dataset.userName + ',' + host.dataset.userProfileId",
+        Viewport::new(400, 300),
+    )?;
+    matches!(frame.script_value(), Value::String(s) if s == "alice,42")
+        .then_some(())
+        .ok_or_else(|| fail("expected dataset to expose camelCase data-* attrs"))
+}
+
+#[test]
 fn cookie_and_storage_seeds_compose_without_interference() -> Result<(), Error> {
     let local_seed = vec![("k".to_owned(), "v".to_owned())];
     let outcome = run_script_with_state(
