@@ -276,6 +276,44 @@ fn session_storage_js_writes_land_in_host_snapshot() -> Result<(), Error> {
 }
 
 #[test]
+fn event_prevent_default_reaches_script_return_value() -> Result<(), Error> {
+    // v3.20 surface check: web-api-cat 0.7.5 event-flow methods
+    // are reachable from a Tauri script via run_script.
+    // dispatchEvent should return false when any listener calls
+    // preventDefault on the decorated event.
+    let frame = run_script(
+        "<html><body><div id='host'></div></body></html>",
+        "",
+        "const host = document.getElementById('host');
+        host.addEventListener('click', (e) => { e.preventDefault(); });
+        host.dispatchEvent({ type: 'click' })",
+        Viewport::new(400, 300),
+    )?;
+    matches!(frame.script_value(), Value::Boolean(false))
+        .then_some(())
+        .ok_or_else(|| fail("expected dispatchEvent to return false after preventDefault"))
+}
+
+#[test]
+fn event_stop_propagation_halts_bubble_through_runtime() -> Result<(), Error> {
+    let frame = run_script(
+        "<html><body><div id='parent'><span id='child'>x</span></div></body></html>",
+        "",
+        "let trace = '';
+        const child = document.getElementById('child');
+        const parent = document.getElementById('parent');
+        child.addEventListener('click', (e) => { trace = trace + 'c'; e.stopPropagation(); });
+        parent.addEventListener('click', () => { trace = trace + 'p'; });
+        child.dispatchEvent({ type: 'click' });
+        trace",
+        Viewport::new(400, 300),
+    )?;
+    matches!(frame.script_value(), Value::String(s) if s == "c")
+        .then_some(())
+        .ok_or_else(|| fail("expected stopPropagation to skip the parent listener"))
+}
+
+#[test]
 fn cookie_and_storage_seeds_compose_without_interference() -> Result<(), Error> {
     let local_seed = vec![("k".to_owned(), "v".to_owned())];
     let outcome = run_script_with_state(
