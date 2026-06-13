@@ -130,12 +130,129 @@ pub fn run_script_with_cookies(
     commands: &HostCommands,
     cookie_string: &str,
 ) -> Result<(Frame, Vec<String>), Error> {
+    run_script_with_state(
+        html_source,
+        css_source,
+        js_source,
+        viewport,
+        commands,
+        cookie_string,
+        &[],
+        &[],
+    )
+    .map(|outcome| {
+        let (frame, writes, _local, _session) = outcome.into_parts();
+        (frame, writes)
+    })
+}
+
+/// Bundle of post-eval state returned by [`run_script_with_state`].
+/// Carries the rendered [`Frame`] plus the cookie write log and
+/// post-eval `localStorage` / `sessionStorage` snapshots, so
+/// callers can persist whichever subset they own.  Constructed
+/// internally; readers use the accessor methods.
+#[must_use]
+pub struct ScriptOutcome {
+    frame: Frame,
+    cookie_writes: Vec<String>,
+    local_storage: Vec<(String, String)>,
+    session_storage: Vec<(String, String)>,
+}
+
+impl ScriptOutcome {
+    /// The rendered frame (display list reflects post-script DOM
+    /// state when back-prop succeeded; otherwise pre-script).
+    #[must_use]
+    pub fn frame(&self) -> &Frame {
+        &self.frame
+    }
+
+    /// Per-write log from `document.cookie =` assignments, in
+    /// write order, with attributes intact.  See
+    /// [`run_script_with_cookies`] for the parsing convention.
+    #[must_use]
+    pub fn cookie_writes(&self) -> &[String] {
+        &self.cookie_writes
+    }
+
+    /// Post-eval `localStorage` key/value pairs in `BTreeMap`
+    /// (sorted-by-key) order.
+    #[must_use]
+    pub fn local_storage(&self) -> &[(String, String)] {
+        &self.local_storage
+    }
+
+    /// Post-eval `sessionStorage` key/value pairs in `BTreeMap`
+    /// (sorted-by-key) order.
+    #[must_use]
+    pub fn session_storage(&self) -> &[(String, String)] {
+        &self.session_storage
+    }
+
+    /// Destructure into `(frame, cookie_writes, local, session)`
+    /// for callers that prefer the flat-tuple shape.
+    #[must_use]
+    #[allow(clippy::type_complexity)]
+    pub fn into_parts(
+        self,
+    ) -> (
+        Frame,
+        Vec<String>,
+        Vec<(String, String)>,
+        Vec<(String, String)>,
+    ) {
+        (
+            self.frame,
+            self.cookie_writes,
+            self.local_storage,
+            self.session_storage,
+        )
+    }
+}
+
+/// Variant of [`run_script_with_cookies`] (v3.18) that also
+/// synchronises `localStorage` and `sessionStorage` projections in
+/// and out of the script.  Pre-eval, each storage Value is seeded
+/// with `local_seed` / `session_seed` via
+/// [`web_api_cat::seed_storage`] (overwriting any previous state).
+/// Post-eval, [`web_api_cat::read_storage_items`] dumps the final
+/// key/value pairs for each into the returned [`ScriptOutcome`].
+///
+/// When the storage Values aren't bound in the env (in practice,
+/// only if a future web-api-cat version drops one of them), the
+/// corresponding seed is silently ignored and the corresponding
+/// post-eval slice comes back empty.
+///
+/// # Errors
+///
+/// Propagates parser, lexer, and JS engine errors.
+#[allow(clippy::too_many_arguments)]
+pub fn run_script_with_state(
+    html_source: &str,
+    css_source: &str,
+    js_source: &str,
+    viewport: Viewport,
+    commands: &HostCommands,
+    cookie_string: &str,
+    local_seed: &[(String, String)],
+    session_seed: &[(String, String)],
+) -> Result<ScriptOutcome, Error> {
     let prepared = prepare(html_source, css_source, viewport, commands)?;
     let document_value = prepared.document_value.clone();
     let stylesheet = prepared.stylesheet.clone();
+    let local_storage_value = web_api_cat::lookup_local_storage(&prepared.env, &prepared.heap);
+    let session_storage_value = web_api_cat::lookup_session_storage(&prepared.env, &prepared.heap);
     let heap = web_api_cat::set_document_cookie(&document_value, prepared.heap, cookie_string);
+    let heap = maybe_seed_storage(local_storage_value.as_ref(), heap, local_seed);
+    let heap = maybe_seed_storage(session_storage_value.as_ref(), heap, session_seed);
     let (value, heap) = evaluate(js_source, prepared.env, heap)?;
     let cookie_writes = web_api_cat::read_cookie_writes(&document_value, &heap);
+    let local_items = local_storage_value
+        .as_ref()
+        .map_or_else(Vec::new, |v| web_api_cat::read_storage_items(v, &heap));
+    let session_items = session_storage_value
+        .as_ref()
+        .map_or_else(Vec::new, |v| web_api_cat::read_storage_items(v, &heap));
     let (dom, layout_tree, display_list) = extract_document(&document_value, &heap)
         .map(|extracted_dom| {
             let new_layout = layout_cat::layout(&extracted_dom, &stylesheet, viewport);
@@ -143,10 +260,24 @@ pub fn run_script_with_cookies(
             (extracted_dom, new_layout, new_display)
         })
         .unwrap_or((prepared.dom, prepared.layout_tree, prepared.display_list));
-    Ok((
-        Frame::new(dom, layout_tree, display_list, value, heap),
+    Ok(ScriptOutcome {
+        frame: Frame::new(dom, layout_tree, display_list, value, heap),
         cookie_writes,
-    ))
+        local_storage: local_items,
+        session_storage: session_items,
+    })
+}
+
+fn maybe_seed_storage(
+    storage_value: Option<&Value>,
+    heap: Heap,
+    seed: &[(String, String)],
+) -> Heap {
+    if let Some(value) = storage_value {
+        web_api_cat::seed_storage(value, heap, seed)
+    } else {
+        heap
+    }
 }
 
 struct Prepared {

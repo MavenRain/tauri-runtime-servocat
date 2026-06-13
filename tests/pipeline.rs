@@ -6,6 +6,7 @@ use boa_cat::Value;
 use paint_cat::PaintCommand;
 use tauri_runtime_servocat::{
     Error, HostCommands, Viewport, render, run_script, run_script_with_cookies,
+    run_script_with_state,
 };
 
 fn fail(_msg: &'static str) -> Error {
@@ -174,6 +175,134 @@ fn document_cookie_multiple_attribute_writes_log_in_order() -> Result<(), Error>
     (writes == vec!["a=1; Path=/".to_owned(), "b=2; Max-Age=600".to_owned()])
         .then_some(())
         .ok_or_else(|| fail("write log must keep order + attributes per entry"))
+}
+
+#[test]
+fn local_storage_seeded_value_visible_to_js() -> Result<(), Error> {
+    let local_seed = vec![("theme".to_owned(), "dark".to_owned())];
+    let outcome = run_script_with_state(
+        "<html></html>",
+        "",
+        "localStorage.getItem('theme')",
+        Viewport::new(400, 300),
+        &HostCommands::new(),
+        "",
+        &local_seed,
+        &[],
+    )?;
+    matches!(outcome.frame().script_value(), Value::String(s) if s == "dark")
+        .then_some(())
+        .ok_or_else(|| fail("expected seeded localStorage entry to be readable from JS"))
+}
+
+#[test]
+fn local_storage_js_setitem_lands_in_host_snapshot() -> Result<(), Error> {
+    let outcome = run_script_with_state(
+        "<html></html>",
+        "",
+        "localStorage.setItem('alpha', 'one'); localStorage.setItem('beta', 'two');",
+        Viewport::new(400, 300),
+        &HostCommands::new(),
+        "",
+        &[],
+        &[],
+    )?;
+    (outcome.local_storage()
+        == [
+            ("alpha".to_owned(), "one".to_owned()),
+            ("beta".to_owned(), "two".to_owned()),
+        ])
+    .then_some(())
+    .ok_or_else(|| fail("expected setItem writes to surface in the post-eval snapshot"))
+}
+
+#[test]
+fn local_storage_js_remove_item_reflects_in_snapshot() -> Result<(), Error> {
+    let local_seed = vec![
+        ("keep".to_owned(), "yes".to_owned()),
+        ("drop".to_owned(), "x".to_owned()),
+    ];
+    let outcome = run_script_with_state(
+        "<html></html>",
+        "",
+        "localStorage.removeItem('drop');",
+        Viewport::new(400, 300),
+        &HostCommands::new(),
+        "",
+        &local_seed,
+        &[],
+    )?;
+    (outcome.local_storage() == [("keep".to_owned(), "yes".to_owned())])
+        .then_some(())
+        .ok_or_else(|| fail("expected removeItem to drop the entry from the snapshot"))
+}
+
+#[test]
+fn session_storage_is_independent_of_local() -> Result<(), Error> {
+    let local_seed = vec![("k".to_owned(), "from-local".to_owned())];
+    let session_seed = vec![("k".to_owned(), "from-session".to_owned())];
+    let outcome = run_script_with_state(
+        "<html></html>",
+        "",
+        "localStorage.getItem('k') + ',' + sessionStorage.getItem('k')",
+        Viewport::new(400, 300),
+        &HostCommands::new(),
+        "",
+        &local_seed,
+        &session_seed,
+    )?;
+    matches!(outcome.frame().script_value(), Value::String(s) if s == "from-local,from-session")
+        .then_some(())
+        .ok_or_else(|| fail("expected localStorage and sessionStorage to be independent"))
+}
+
+#[test]
+fn session_storage_js_writes_land_in_host_snapshot() -> Result<(), Error> {
+    let outcome = run_script_with_state(
+        "<html></html>",
+        "",
+        "sessionStorage.setItem('once', 'now');",
+        Viewport::new(400, 300),
+        &HostCommands::new(),
+        "",
+        &[],
+        &[],
+    )?;
+    (outcome.session_storage() == [("once".to_owned(), "now".to_owned())])
+        .then_some(())
+        .ok_or_else(|| {
+            fail("expected sessionStorage writes to surface separately from localStorage")
+        })
+}
+
+#[test]
+fn cookie_and_storage_seeds_compose_without_interference() -> Result<(), Error> {
+    let local_seed = vec![("k".to_owned(), "v".to_owned())];
+    let outcome = run_script_with_state(
+        "<html></html>",
+        "",
+        "document.cookie = 'session=abc';
+        localStorage.setItem('k2', 'v2');
+        document.cookie + '|' + localStorage.getItem('k')",
+        Viewport::new(400, 300),
+        &HostCommands::new(),
+        "user=anon",
+        &local_seed,
+        &[],
+    )?;
+    matches!(outcome.frame().script_value(), Value::String(s) if s == "user=anon; session=abc|v")
+        .then_some(())
+        .ok_or_else(|| fail("expected cookie seed + local seed both visible to JS"))?;
+    (outcome.cookie_writes() == ["session=abc".to_owned()])
+        .then_some(())
+        .ok_or_else(|| fail("expected cookie write log to surface"))?;
+    (outcome.local_storage()
+        == [
+            ("k".to_owned(), "v".to_owned()),
+            ("k2".to_owned(), "v2".to_owned()),
+        ])
+    .then_some(())
+    .ok_or_else(|| fail("expected local snapshot to merge seed + JS write"))
 }
 
 #[test]

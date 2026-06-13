@@ -1,8 +1,8 @@
 [package]
 name = "tauri-runtime-servocat"
-version = "3.17.0"
+version = "3.18.0"
 edition = "2024"
-description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.17.0 pulls in the web-api-cat 0.7 chapter (boa-cat 0.7 -> 0.7.1, web-api-cat 0.6 -> 0.7.4): user-supplied webview scripts now have addEventListener / removeEventListener / dispatchEvent with bubble dispatch up the parent chain, localStorage / sessionStorage Storage-shaped objects, Promise-based fetch (`await fetch(url)` + `r.text()` + HTTPS via rustls), and an inline `style=\"...\"` round-trip that reaches layout-cat through extract_document.  No tauri-runtime-servocat source change beyond the manifest -- the dep bump exposes the new surface to scripts uniformly."
+description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.18.0 closes the host-side storage loop: new `run_script_with_state(..., cookie_string, local_seed, session_seed)` entry returns a `ScriptOutcome` carrying the rendered frame plus the cookie write log AND post-eval localStorage / sessionStorage snapshots; `WebviewState` gains per-webview `local_storage` / `session_storage` jars persisted across evals.  `run_script_with_cookies` becomes a wrapper that defaults the storage seeds to empty.  Seventh sub-crate of a Servo-replacement webview runtime targeting Tauri."
 license = "MIT OR Apache-2.0"
 keywords = ["tauri", "runtime", "browser", "servo", "type-driven"]
 categories = ["gui", "rendering"]

@@ -101,7 +101,7 @@ use winit::window::{Fullscreen, Window, WindowAttributes, WindowId as WinitWindo
 use crate::frame::Frame;
 use crate::ipc::HostCommands;
 use crate::raster::{PixelBuffer, render_commands_to_pixels_with, render_to_pixels_with};
-use crate::script::run_script_with_cookies;
+use crate::script::run_script_with_state;
 use crate::text::TextRenderer;
 use layout_cat::Viewport;
 
@@ -2206,6 +2206,8 @@ struct WebviewState<T: UserEvent> {
     background_color: Option<Color>,
     auto_resize: bool,
     cookies: Vec<Cookie<'static>>,
+    local_storage: Vec<(String, String)>,
+    session_storage: Vec<(String, String)>,
 }
 
 impl<T: UserEvent> WebviewState<T> {
@@ -2234,6 +2236,8 @@ impl<T: UserEvent> WebviewState<T> {
             background_color: None,
             auto_resize: false,
             cookies: Vec::new(),
+            local_storage: Vec::new(),
+            session_storage: Vec::new(),
         }
     }
 
@@ -2266,17 +2270,31 @@ impl<T: UserEvent> WebviewState<T> {
         // `HttpOnly`; that filter is only relevant to scripting
         // visibility.
         let outbound = js_visible_cookie_string(&self.cookies);
-        let (frame, write_log) = run_script_with_cookies(
+        // v3.18: thread localStorage / sessionStorage through the
+        // eval the same way cookies do.  Pre-eval seeds overwrite
+        // the JS-side projection so scripts see whatever the host
+        // persisted from the previous run; post-eval the final
+        // key/value pairs come back as `Vec<(String, String)>` and
+        // replace the host-side state in one shot.  Per-write
+        // logging isn't needed for storage (Storage spec has no
+        // attribute semantics, unlike cookies' Set-Cookie); the
+        // post-eval snapshot is authoritative.
+        let outcome = run_script_with_state(
             &self.html,
             &self.css,
             script,
             self.viewport,
             &HostCommands::new().with("post_ipc_message", post_ipc_message_impl),
             &outbound,
+            &self.local_storage,
+            &self.session_storage,
         )
         .ok()?;
+        let (frame, write_log, local_items, session_items) = outcome.into_parts();
         let parsed_writes = parse_cookie_write_log(&write_log);
         merge_cookies(&mut self.cookies, parsed_writes);
+        self.local_storage = local_items;
+        self.session_storage = session_items;
         let value = format!("{}", frame.script_value());
         self.current_frame = Some(frame);
         Some(value)
