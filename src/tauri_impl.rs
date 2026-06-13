@@ -65,6 +65,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::num::NonZeroU32;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -2217,6 +2218,8 @@ impl<T: UserEvent> WebviewState<T> {
         viewport: Viewport,
         ipc_handler: Option<WebviewIpcHandler<T, ServocatRuntime<T>>>,
     ) -> Self {
+        // v3.19: load BEFORE moving `label` into the struct.
+        let persisted_local = load_pairs(&local_storage_file(&local_storage_base_dir(), &label));
         Self {
             label,
             html,
@@ -2236,7 +2239,11 @@ impl<T: UserEvent> WebviewState<T> {
             background_color: None,
             auto_resize: false,
             cookies: Vec::new(),
-            local_storage: Vec::new(),
+            // v3.19: localStorage loads from disk on construct so
+            // values survive webview close + reopen.
+            // sessionStorage stays in-memory per Storage spec
+            // (each webview instance is its own session).
+            local_storage: persisted_local,
             session_storage: Vec::new(),
         }
     }
@@ -2293,6 +2300,14 @@ impl<T: UserEvent> WebviewState<T> {
         let (frame, write_log, local_items, session_items) = outcome.into_parts();
         let parsed_writes = parse_cookie_write_log(&write_log);
         merge_cookies(&mut self.cookies, parsed_writes);
+        // v3.19: persist localStorage to disk so the in-memory
+        // jar survives webview close.  Write through every eval
+        // for simplicity; the data sets are small and the
+        // alternative (Drop impl) is fragile in test harnesses.
+        save_pairs(
+            &local_storage_file(&local_storage_base_dir(), &self.label),
+            &local_items,
+        );
         self.local_storage = local_items;
         self.session_storage = session_items;
         let value = format!("{}", frame.script_value());
@@ -2311,6 +2326,87 @@ impl<T: UserEvent> WebviewState<T> {
 fn viewport_from_size(size: tauri_runtime::dpi::Size, scale_factor: f64) -> Viewport {
     let physical: PhysicalSize<u32> = size.to_physical(scale_factor);
     Viewport::new(physical.width, physical.height)
+}
+
+/// v3.19: base directory under which per-webview localStorage
+/// files live.  Defaults to `$HOME/.tauri-runtime-servocat-storage`;
+/// falls back to `$TMPDIR/tauri-runtime-servocat-storage` when
+/// `HOME` is unset (rare on desktop, common in `cargo test` under
+/// some CI shells).  Result has no leading dot when sourced from
+/// `TMPDIR` since that location is already user-private.
+fn local_storage_base_dir() -> PathBuf {
+    std::env::var_os("HOME").map_or_else(
+        || std::env::temp_dir().join("tauri-runtime-servocat-storage"),
+        |home| PathBuf::from(home).join(".tauri-runtime-servocat-storage"),
+    )
+}
+
+/// v3.19: full path to a webview's localStorage file under
+/// `base_dir`, sanitised so the label can't escape via
+/// directory-traversal sequences.  Non-alphanumeric characters
+/// (excluding `-` and `_`) collapse to `_`; collisions between
+/// distinct labels are accepted as a v0 trade-off.
+fn local_storage_file(base_dir: &Path, label: &str) -> PathBuf {
+    base_dir.join(sanitise_label(label)).join("local.bin")
+}
+
+fn sanitise_label(label: &str) -> String {
+    label
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// v3.19: serialise `items` into the on-disk wire format.  Each
+/// pair is encoded as `key\0value`; pairs are separated by
+/// `\x01`.  Both delimiter bytes are illegal in well-formed JS
+/// strings as a practical matter (no real-world script stores
+/// `\0` or `\x01` in a localStorage key/value), so the format is
+/// unambiguous without escape sequences.  Empty inputs round-trip
+/// to the empty string.
+fn encode_pairs(items: &[(String, String)]) -> String {
+    items
+        .iter()
+        .map(|(k, v)| format!("{k}\0{v}"))
+        .collect::<Vec<_>>()
+        .join("\x01")
+}
+
+/// v3.19: inverse of [`encode_pairs`].  Splits on `\x01`, then
+/// on the first `\0` within each chunk; entries missing a `\0`
+/// (corrupted) are silently dropped.
+fn decode_pairs(text: &str) -> Vec<(String, String)> {
+    text.split('\x01')
+        .filter(|s| !s.is_empty())
+        .filter_map(|pair| pair.split_once('\0'))
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect()
+}
+
+/// v3.19: read + decode the pair file at `path`.  Missing files,
+/// I/O errors, and decode failures all collapse to the empty
+/// `Vec` -- a fresh webview starts with no persisted state,
+/// matching what the in-memory-only v3.18 behaviour produced.
+fn load_pairs(path: &Path) -> Vec<(String, String)> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|text| decode_pairs(&text))
+        .unwrap_or_default()
+}
+
+/// v3.19: encode + write `items` to `path`, creating the parent
+/// directory if missing.  Every error -- mkdir, write, encode --
+/// is swallowed; persistence is best-effort and the in-memory
+/// jar remains authoritative within the running webview.
+fn save_pairs(path: &Path, items: &[(String, String)]) {
+    let _ = path.parent().map(std::fs::create_dir_all);
+    let _ = std::fs::write(path, encode_pairs(items));
 }
 
 fn js_visible_cookie_string(jar: &[Cookie<'static>]) -> String {
@@ -3837,9 +3933,10 @@ impl<T: UserEvent, F: FnMut(RunEvent<T>) + 'static> ApplicationHandler<RuntimeEv
 #[cfg(test)]
 mod tests {
     use super::{
-        Cookie, cookie_header_value, cookie_is_expired, is_redirect_status,
-        jar_with_set_cookies_merged, js_visible_cookie_string, merge_cookies,
-        parse_cookie_write_log, redirect_target_url, viewport_from_size,
+        Cookie, cookie_header_value, cookie_is_expired, decode_pairs, encode_pairs,
+        is_redirect_status, jar_with_set_cookies_merged, js_visible_cookie_string, load_pairs,
+        local_storage_file, merge_cookies, parse_cookie_write_log, redirect_target_url,
+        sanitise_label, save_pairs, viewport_from_size,
     };
     use cookie::time::{Duration, OffsetDateTime};
 
@@ -4313,5 +4410,101 @@ mod tests {
         (viewport.width() == 800 && viewport.height() == 600)
             .then_some(())
             .ok_or_else(|| fail("logical size at scale 1 should match its numeric dimensions"))
+    }
+
+    #[test]
+    fn encode_decode_pairs_round_trips() -> Result<(), tauri_runtime::Error> {
+        let original = vec![
+            ("alpha".to_owned(), "one".to_owned()),
+            ("beta".to_owned(), "two".to_owned()),
+            ("gamma".to_owned(), "three".to_owned()),
+        ];
+        let encoded = encode_pairs(&original);
+        let decoded = decode_pairs(&encoded);
+        (decoded == original)
+            .then_some(())
+            .ok_or_else(|| fail("encode + decode should be the identity"))
+    }
+
+    #[test]
+    fn encode_decode_pairs_handles_empty() -> Result<(), tauri_runtime::Error> {
+        let original: Vec<(String, String)> = Vec::new();
+        let encoded = encode_pairs(&original);
+        let decoded = decode_pairs(&encoded);
+        (encoded.is_empty() && decoded.is_empty())
+            .then_some(())
+            .ok_or_else(|| fail("empty input should encode to empty and decode back empty"))
+    }
+
+    #[test]
+    fn encode_decode_pairs_preserves_special_characters() -> Result<(), tauri_runtime::Error> {
+        // Newlines, quotes, equals signs, and Unicode should all
+        // survive the round-trip since the null + SOH delimiters
+        // never collide with ordinary script-supplied values.
+        let original = vec![
+            ("line\nbreak".to_owned(), "tab\there".to_owned()),
+            ("quote\"".to_owned(), "equals=sign".to_owned()),
+            ("ünîcødé".to_owned(), "🦀 rust".to_owned()),
+        ];
+        let encoded = encode_pairs(&original);
+        let decoded = decode_pairs(&encoded);
+        (decoded == original)
+            .then_some(())
+            .ok_or_else(|| fail("special characters should round-trip unchanged"))
+    }
+
+    #[test]
+    fn save_then_load_pairs_round_trips_via_tmp() -> Result<(), tauri_runtime::Error> {
+        let dir = std::env::temp_dir().join(format!(
+            "tauri-runtime-servocat-storage-test-{}",
+            std::process::id()
+        ));
+        let path = dir.join("pairs.bin");
+        let original = vec![
+            ("k1".to_owned(), "v1".to_owned()),
+            ("k2".to_owned(), "v2".to_owned()),
+        ];
+        save_pairs(&path, &original);
+        let loaded = load_pairs(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        (loaded == original)
+            .then_some(())
+            .ok_or_else(|| fail("save + load via tmp should round-trip"))
+    }
+
+    #[test]
+    fn load_pairs_from_nonexistent_file_returns_empty() -> Result<(), tauri_runtime::Error> {
+        let path = std::env::temp_dir().join("tauri-runtime-servocat-nonexistent-xxx.bin");
+        let _ = std::fs::remove_file(&path);
+        let loaded = load_pairs(&path);
+        loaded
+            .is_empty()
+            .then_some(())
+            .ok_or_else(|| fail("missing file should produce an empty vec, not an error"))
+    }
+
+    #[test]
+    fn sanitise_label_collapses_unsafe_chars() -> Result<(), tauri_runtime::Error> {
+        let cases = [
+            ("main", "main"),
+            ("my window!", "my_window_"),
+            ("../etc/passwd", "___etc_passwd"),
+            ("alpha-beta_gamma", "alpha-beta_gamma"),
+        ];
+        cases
+            .iter()
+            .all(|(input, expected)| sanitise_label(input) == *expected)
+            .then_some(())
+            .ok_or_else(|| fail("expected sanitised labels to match the table"))
+    }
+
+    #[test]
+    fn local_storage_file_paths_separate_by_label() -> Result<(), tauri_runtime::Error> {
+        let base = std::path::PathBuf::from("/tmp/whatever");
+        let first = local_storage_file(&base, "alpha");
+        let second = local_storage_file(&base, "beta");
+        (first != second && first.ends_with("alpha/local.bin"))
+            .then_some(())
+            .ok_or_else(|| fail("expected each label to land in its own subdirectory"))
     }
 }
