@@ -281,12 +281,15 @@ fn event_prevent_default_reaches_script_return_value() -> Result<(), Error> {
     // are reachable from a Tauri script via run_script.
     // dispatchEvent should return false when any listener calls
     // preventDefault on the decorated event.
+    // v3.24 (web-api-cat 0.7.10): `cancelable: true` is required
+    // for preventDefault to flip defaultPrevented per the spec
+    // gate.
     let frame = run_script(
         "<html><body><div id='host'></div></body></html>",
         "",
         "const host = document.getElementById('host');
         host.addEventListener('click', (e) => { e.preventDefault(); });
-        host.dispatchEvent({ type: 'click' })",
+        host.dispatchEvent({ type: 'click', cancelable: true })",
         Viewport::new(400, 300),
     )?;
     matches!(frame.script_value(), Value::Boolean(false))
@@ -407,12 +410,14 @@ fn user_reference_sees_default_prevented_through_runtime() -> Result<(), Error> 
     // v3.23 surface check: in-place decoration means a script's
     // `const e = new Event('click')` reference reflects what
     // listeners did during `el.dispatchEvent(e)`.
+    // v3.24 (web-api-cat 0.7.10): `cancelable: true` is required
+    // for preventDefault to flip the flag per the spec gate.
     let frame = run_script(
         "<html><body><div id='host'></div></body></html>",
         "",
         "const host = document.getElementById('host');
         host.addEventListener('click', (e) => { e.preventDefault(); });
-        const e = new Event('click');
+        const e = new Event('click', { cancelable: true });
         host.dispatchEvent(e);
         e.defaultPrevented",
         Viewport::new(400, 300),
@@ -439,6 +444,26 @@ fn custom_event_detail_through_runtime() -> Result<(), Error> {
     matches!(frame.script_value(), Value::String(s) if s == "alice")
         .then_some(())
         .ok_or_else(|| fail("expected CustomEvent detail to reach the listener through run_script"))
+}
+
+#[test]
+fn prevent_default_noop_on_non_cancelable_event_through_runtime() -> Result<(), Error> {
+    // v3.24 (web-api-cat 0.7.10) surface check: a script that
+    // calls preventDefault on a non-cancelable event should see
+    // dispatchEvent return true.
+    let frame = run_script(
+        "<html><body><div id='host'></div></body></html>",
+        "",
+        "const host = document.getElementById('host');
+        host.addEventListener('click', (e) => { e.preventDefault(); });
+        host.dispatchEvent(new Event('click'))",
+        Viewport::new(400, 300),
+    )?;
+    matches!(frame.script_value(), Value::Boolean(true))
+        .then_some(())
+        .ok_or_else(|| {
+            fail("expected dispatchEvent to return true when event is not cancelable")
+        })
 }
 
 #[test]
