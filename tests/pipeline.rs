@@ -511,6 +511,70 @@ fn query_selector_all_iterable_via_for_loop_through_runtime() -> Result<(), Erro
 }
 
 #[test]
+fn sibling_combinator_through_runtime() -> Result<(), Error> {
+    // v3.26 surface check: web-api-cat 0.7.12 adjacent sibling
+    // combinator reaches scripts via run_script.  `h2 + p`
+    // matches the p immediately after the heading.
+    let frame = run_script(
+        "<html><body>
+            <h2>title</h2>
+            <p id='lead'>lead paragraph</p>
+            <p>body paragraph</p>
+        </body></html>",
+        "",
+        "document.querySelector('h2 + p').id",
+        Viewport::new(400, 300),
+    )?;
+    matches!(frame.script_value(), Value::String(s) if s == "lead")
+        .then_some(())
+        .ok_or_else(|| fail("expected 'h2 + p' to pick the p right after the heading"))
+}
+
+#[test]
+fn element_matches_and_closest_through_runtime() -> Result<(), Error> {
+    // v3.26 surface check: web-api-cat 0.7.13 Element.matches
+    // and Element.closest reach scripts via run_script.
+    let frame = run_script(
+        "<html><body>
+            <section class='wrap'>
+                <article>
+                    <p id='leaf'>x</p>
+                </article>
+            </section>
+        </body></html>",
+        "",
+        "const leaf = document.getElementById('leaf');
+        const wrap = leaf.closest('.wrap');
+        const ok = leaf.matches('p') === true && wrap !== null && wrap.matches('section');
+        ok ? 'ok' : 'wrong'",
+        Viewport::new(400, 300),
+    )?;
+    matches!(frame.script_value(), Value::String(s) if s == "ok")
+        .then_some(())
+        .ok_or_else(|| fail("expected matches + closest to round-trip through the runtime"))
+}
+
+#[test]
+fn first_child_pseudo_class_through_runtime() -> Result<(), Error> {
+    // v3.26 surface check: web-api-cat 0.7.13 :first-child
+    // pseudo-class is reachable from scripts.
+    let frame = run_script(
+        "<html><body>
+            <section><p>a</p><p>b</p></section>
+            <section><p>c</p><p>d</p></section>
+        </body></html>",
+        "",
+        "document.querySelectorAll('p:first-child').length",
+        Viewport::new(400, 300),
+    )?;
+    matches!(frame.script_value(), Value::Number(n) if (n - 2.0).abs() < 1e-9)
+        .then_some(())
+        .ok_or_else(|| {
+            fail("expected p:first-child to match one p per section (length === 2)")
+        })
+}
+
+#[test]
 fn cookie_and_storage_seeds_compose_without_interference() -> Result<(), Error> {
     let local_seed = vec![("k".to_owned(), "v".to_owned())];
     let outcome = run_script_with_state(
