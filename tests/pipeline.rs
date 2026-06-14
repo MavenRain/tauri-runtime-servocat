@@ -467,6 +467,50 @@ fn prevent_default_noop_on_non_cancelable_event_through_runtime() -> Result<(), 
 }
 
 #[test]
+fn query_selector_all_returns_node_list_through_runtime() -> Result<(), Error> {
+    // v3.25 surface check: web-api-cat 0.7.11
+    // querySelectorAll returns a NodeList-shaped Object whose
+    // length and entries are scriptable.
+    let frame = run_script(
+        "<html><body>
+            <p id='a'>x</p>
+            <p id='b'>y</p>
+            <p id='c'>z</p>
+        </body></html>",
+        "",
+        "document.querySelectorAll('p').length",
+        Viewport::new(400, 300),
+    )?;
+    matches!(frame.script_value(), Value::Number(n) if (n - 3.0).abs() < 1e-9)
+        .then_some(())
+        .ok_or_else(|| fail("expected document.querySelectorAll('p').length === 3"))
+}
+
+#[test]
+fn query_selector_all_iterable_via_for_loop_through_runtime() -> Result<(), Error> {
+    // Script-side `for (let i = 0; i < list.length; i = i + 1) list[i]`
+    // pattern works against the NodeList shape.
+    let frame = run_script(
+        "<html><body>
+            <p>a</p>
+            <p>b</p>
+            <p>c</p>
+        </body></html>",
+        "",
+        "const ps = document.querySelectorAll('p');
+        let acc = '';
+        for (let i = 0; i < ps.length; i = i + 1) {
+            acc = acc + ps[i].textContent;
+        }
+        acc",
+        Viewport::new(400, 300),
+    )?;
+    matches!(frame.script_value(), Value::String(s) if s == "abc")
+        .then_some(())
+        .ok_or_else(|| fail("expected for-loop iteration over NodeList to visit textContent in order"))
+}
+
+#[test]
 fn cookie_and_storage_seeds_compose_without_interference() -> Result<(), Error> {
     let local_seed = vec![("k".to_owned(), "v".to_owned())];
     let outcome = run_script_with_state(
