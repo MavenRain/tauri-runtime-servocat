@@ -388,6 +388,60 @@ fn attribute_selector_through_runtime() -> Result<(), Error> {
 }
 
 #[test]
+fn new_event_constructor_reachable_through_runtime() -> Result<(), Error> {
+    // v3.23 surface check: web-api-cat 0.7.9 Event
+    // constructor.  `new Event('click').type` round-trips.
+    let frame = run_script(
+        "<html><body></body></html>",
+        "",
+        "new Event('click').type",
+        Viewport::new(400, 300),
+    )?;
+    matches!(frame.script_value(), Value::String(s) if s == "click")
+        .then_some(())
+        .ok_or_else(|| fail("expected new Event('click').type to return 'click' via run_script"))
+}
+
+#[test]
+fn user_reference_sees_default_prevented_through_runtime() -> Result<(), Error> {
+    // v3.23 surface check: in-place decoration means a script's
+    // `const e = new Event('click')` reference reflects what
+    // listeners did during `el.dispatchEvent(e)`.
+    let frame = run_script(
+        "<html><body><div id='host'></div></body></html>",
+        "",
+        "const host = document.getElementById('host');
+        host.addEventListener('click', (e) => { e.preventDefault(); });
+        const e = new Event('click');
+        host.dispatchEvent(e);
+        e.defaultPrevented",
+        Viewport::new(400, 300),
+    )?;
+    matches!(frame.script_value(), Value::Boolean(true))
+        .then_some(())
+        .ok_or_else(|| {
+            fail("expected user-held reference to see defaultPrevented true after dispatch")
+        })
+}
+
+#[test]
+fn custom_event_detail_through_runtime() -> Result<(), Error> {
+    let frame = run_script(
+        "<html><body><div id='host'></div></body></html>",
+        "",
+        "let received = '';
+        const host = document.getElementById('host');
+        host.addEventListener('greet', (e) => { received = e.detail.name; });
+        host.dispatchEvent(new CustomEvent('greet', { detail: { name: 'alice' } }));
+        received",
+        Viewport::new(400, 300),
+    )?;
+    matches!(frame.script_value(), Value::String(s) if s == "alice")
+        .then_some(())
+        .ok_or_else(|| fail("expected CustomEvent detail to reach the listener through run_script"))
+}
+
+#[test]
 fn cookie_and_storage_seeds_compose_without_interference() -> Result<(), Error> {
     let local_seed = vec![("k".to_owned(), "v".to_owned())];
     let outcome = run_script_with_state(
