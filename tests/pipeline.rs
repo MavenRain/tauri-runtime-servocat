@@ -354,6 +354,40 @@ fn dataset_camelcase_read_through_runtime() -> Result<(), Error> {
 }
 
 #[test]
+fn descendant_combinator_selector_through_runtime() -> Result<(), Error> {
+    // v3.22 surface check: web-api-cat 0.7.8 extended
+    // selector grammar.  `section p` should walk through
+    // an intermediate article to reach the p.
+    let frame = run_script(
+        "<html><body><section><article><p id='deep'>x</p></article></section></body></html>",
+        "",
+        "document.querySelector('section p').id",
+        Viewport::new(400, 300),
+    )?;
+    matches!(frame.script_value(), Value::String(s) if s == "deep")
+        .then_some(())
+        .ok_or_else(|| fail("expected descendant combinator to reach the nested p"))
+}
+
+#[test]
+fn attribute_selector_through_runtime() -> Result<(), Error> {
+    // v3.22 surface check: attribute selectors with operators.
+    // `a[href^="https"]` should pick the absolute-URL link.
+    let frame = run_script(
+        "<html><body>
+            <a id='internal' href='/about'>x</a>
+            <a id='external' href='https://example.com'>y</a>
+        </body></html>",
+        "",
+        "document.querySelector('a[href^=\"https\"]').id",
+        Viewport::new(400, 300),
+    )?;
+    matches!(frame.script_value(), Value::String(s) if s == "external")
+        .then_some(())
+        .ok_or_else(|| fail("expected [href^=https] selector to pick the absolute-URL anchor"))
+}
+
+#[test]
 fn cookie_and_storage_seeds_compose_without_interference() -> Result<(), Error> {
     let local_seed = vec![("k".to_owned(), "v".to_owned())];
     let outcome = run_script_with_state(
