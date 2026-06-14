@@ -1,8 +1,8 @@
 [package]
 name = "tauri-runtime-servocat"
-version = "3.26.0"
+version = "3.27.0"
 edition = "2024"
-description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.26.0 picks up web-api-cat 0.7.12 + 0.7.13: user-supplied webview scripts get sibling combinators (`a + b` adjacent, `a ~ b` general), `Element.matches(selector)` predicate, `Element.closest(selector)` (walks ancestors inclusive of self), and structural pseudo-classes (`:first-child`, `:last-child`, `:only-child`).  No tauri-runtime-servocat source change beyond the manifest.  Seventh sub-crate of a Servo-replacement webview runtime targeting Tauri."
+description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.27.0 picks up web-api-cat 0.7.14: `getElementsByTagName(name)` and `getElementsByClassName(classNames)` are now reachable from user-supplied webview scripts on both `Element` and `document`, returning NodeList-shaped Objects.  No tauri-runtime-servocat source change beyond the manifest.  Seventh sub-crate of a Servo-replacement webview runtime targeting Tauri."
 license = "MIT OR Apache-2.0"
 keywords = ["tauri", "runtime", "browser", "servo", "type-driven"]
 categories = ["gui", "rendering"]
@@ -16,7 +16,7 @@ paint-cat = "0.2"
 net-cat = { version = "0.3", features = ["tls"] }
 boa-cat = "0.7.2"
 ecma-runtime-cat = "0.3.1"
-web-api-cat = "0.7.13"
+web-api-cat = "0.7.14"
 ecma-lex-cat = "0.1"
 ecma-parse-cat = "0.3"
 tiny-skia = "0.12"

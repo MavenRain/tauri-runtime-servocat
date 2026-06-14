@@ -575,6 +575,49 @@ fn first_child_pseudo_class_through_runtime() -> Result<(), Error> {
 }
 
 #[test]
+fn get_elements_by_tag_name_through_runtime() -> Result<(), Error> {
+    // v3.27 surface check: web-api-cat 0.7.14
+    // getElementsByTagName returns a NodeList whose length and
+    // entries are scriptable through run_script.
+    let frame = run_script(
+        "<html><body>
+            <p>a</p>
+            <div><p>b</p></div>
+            <p>c</p>
+        </body></html>",
+        "",
+        "document.getElementsByTagName('p').length",
+        Viewport::new(400, 300),
+    )?;
+    matches!(frame.script_value(), Value::Number(n) if (n - 3.0).abs() < 1e-9)
+        .then_some(())
+        .ok_or_else(|| fail("expected getElementsByTagName('p').length === 3"))
+}
+
+#[test]
+fn get_elements_by_class_name_requires_all_classes_through_runtime() -> Result<(), Error> {
+    // v3.27 surface check: web-api-cat 0.7.14
+    // getElementsByClassName requires ALL specified classes to
+    // be present on each match.
+    let frame = run_script(
+        "<html><body>
+            <div class='alpha'>a</div>
+            <div class='alpha beta'>b</div>
+            <div class='alpha beta gamma'>c</div>
+            <div class='beta'>d</div>
+        </body></html>",
+        "",
+        "document.getElementsByClassName('alpha beta').length",
+        Viewport::new(400, 300),
+    )?;
+    matches!(frame.script_value(), Value::Number(n) if (n - 2.0).abs() < 1e-9)
+        .then_some(())
+        .ok_or_else(|| {
+            fail("expected getElementsByClassName('alpha beta') to require both classes")
+        })
+}
+
+#[test]
 fn cookie_and_storage_seeds_compose_without_interference() -> Result<(), Error> {
     let local_seed = vec![("k".to_owned(), "v".to_owned())];
     let outcome = run_script_with_state(
