@@ -1,11 +1,15 @@
 //! The `Frame`: everything the meta-crate produces from one
 //! render/script call.
 
+use std::collections::BTreeMap;
+
 use boa_cat::Value;
 use boa_cat::heap::Heap;
-use dom_cat::Document as DomDocument;
+use dom_cat::{Document as DomDocument, NodeId};
 use layout_cat::LayoutTree;
 use paint_cat::DisplayList;
+
+use crate::images::DecodedImage;
 
 /// A complete frame.  Carries everything downstream code needs to
 /// paint the page or inspect the post-script state.
@@ -16,10 +20,13 @@ pub struct Frame {
     display_list: DisplayList,
     script_value: Value,
     script_heap: Heap,
+    decoded_images: BTreeMap<NodeId, DecodedImage>,
 }
 
 impl Frame {
-    /// Build a frame.
+    /// Build a frame.  Defaults to no decoded images; call
+    /// [`Frame::with_decoded_images`] to attach the v3.32.0 image
+    /// asset map.
     #[must_use]
     pub fn new(
         document: DomDocument,
@@ -34,7 +41,26 @@ impl Frame {
             display_list,
             script_value,
             script_heap,
+            decoded_images: BTreeMap::new(),
         }
+    }
+
+    /// v3.32.0: attach a `NodeId -> DecodedImage` map so the
+    /// rasterizer can stamp each decoded image at the matching
+    /// `<img>` element's layout rect.  Consumes and returns the
+    /// frame to keep the builder pattern compositional.
+    #[must_use]
+    pub fn with_decoded_images(mut self, decoded_images: BTreeMap<NodeId, DecodedImage>) -> Self {
+        self.decoded_images = decoded_images;
+        self
+    }
+
+    /// v3.32.0: the decoded image map (possibly empty).  The
+    /// rasterizer walks the layout tree and stamps each box whose
+    /// `dom_node()` is in this map.
+    #[must_use]
+    pub fn decoded_images(&self) -> &BTreeMap<NodeId, DecodedImage> {
+        &self.decoded_images
     }
 
     /// The parsed and (when scripted) mutated DOM.

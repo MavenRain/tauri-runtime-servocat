@@ -8,10 +8,14 @@
 //! - No clipping, transforms, or stacking contexts.
 //! - No anti-aliased path edges beyond what tiny-skia gives by default.
 
+use layout_cat::LayoutBox;
 use paint_cat::PaintCommand;
-use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform};
+use tiny_skia::{
+    FillRule, FilterQuality, Paint, PathBuilder, Pixmap, PixmapPaint, Rect, Stroke, Transform,
+};
 
 use crate::frame::Frame;
+use crate::images::DecodedImage;
 use crate::text::TextRenderer;
 
 /// A rasterized pixel buffer.
@@ -72,6 +76,13 @@ pub fn render_to_pixels(frame: &Frame, width: u32, height: u32) -> PixelBuffer {
 /// Rasterize `frame` into an RGBA pixel buffer of the given size using
 /// a caller-supplied [`TextRenderer`].  Reuse the renderer across
 /// calls to amortize the font-loading cost.
+///
+/// v3.32.0: after rasterizing the display list, also stamps every
+/// decoded image in `frame.decoded_images()` at its matching
+/// `<img>` layout-box rect.  Frames built via [`crate::render`]
+/// have an empty decoded-image map; frames built via
+/// [`crate::render_with_inline_assets`] carry the decoded data:
+/// PNGs.
 #[must_use]
 pub fn render_to_pixels_with(
     frame: &Frame,
@@ -79,12 +90,95 @@ pub fn render_to_pixels_with(
     height: u32,
     text_renderer: &mut TextRenderer,
 ) -> PixelBuffer {
-    render_commands_to_pixels_with(
-        frame.display_list().commands(),
+    let bytes = Pixmap::new(width, height).map_or_else(
+        || empty_bytes(width, height),
+        |pixmap| {
+            let pixmap =
+                paint_commands_into(pixmap, frame.display_list().commands(), text_renderer);
+            let pixmap = stamp_decoded_images(pixmap, frame);
+            pixmap.take()
+        },
+    );
+    PixelBuffer {
         width,
         height,
-        text_renderer,
-    )
+        bytes,
+    }
+}
+
+fn paint_commands_into(
+    pixmap_in: Pixmap,
+    commands: &[PaintCommand],
+    text_renderer: &mut TextRenderer,
+) -> Pixmap {
+    let mut pixmap = pixmap_in;
+    pixmap.fill(tiny_skia::Color::TRANSPARENT);
+    #[allow(clippy::needless_for_each)]
+    commands.iter().for_each(|cmd| {
+        apply_command(&mut pixmap, cmd, text_renderer);
+    });
+    pixmap
+}
+
+fn stamp_decoded_images(pixmap_in: Pixmap, frame: &Frame) -> Pixmap {
+    let mut pixmap = pixmap_in;
+    let decoded = frame.decoded_images();
+    if decoded.is_empty() {
+        return pixmap;
+    }
+    if let Some(root) = frame.layout_tree().root_box() {
+        walk_layout_boxes(root, &mut |layout_box| {
+            if let Some(decoded_image) = decoded.get(&layout_box.dom_node()) {
+                stamp_one_image(&mut pixmap, &layout_box.rect(), decoded_image);
+            }
+        });
+    }
+    pixmap
+}
+
+fn walk_layout_boxes<F: FnMut(&LayoutBox)>(layout_box: &LayoutBox, callback: &mut F) {
+    callback(layout_box);
+    #[allow(clippy::needless_for_each)]
+    layout_box.children().iter().for_each(|child| {
+        walk_layout_boxes(child, callback);
+    });
+}
+
+fn stamp_one_image(pixmap: &mut Pixmap, target: &layout_cat::Rect, decoded: &DecodedImage) {
+    let Some(source_pixmap) = pixmap_from_decoded(decoded) else {
+        return;
+    };
+    let Some(target_rect) = rect_to_skia(target) else {
+        return;
+    };
+    let scale_x = target_rect.width() / u32_to_f32_lossy(source_pixmap.width().max(1));
+    let scale_y = target_rect.height() / u32_to_f32_lossy(source_pixmap.height().max(1));
+    let transform =
+        Transform::from_scale(scale_x, scale_y).post_translate(target_rect.x(), target_rect.y());
+    let paint = PixmapPaint {
+        opacity: 1.0,
+        blend_mode: tiny_skia::BlendMode::SourceOver,
+        quality: FilterQuality::Bilinear,
+    };
+    pixmap.draw_pixmap(0, 0, source_pixmap.as_ref(), &paint, transform, None);
+}
+
+fn pixmap_from_decoded(decoded: &DecodedImage) -> Option<Pixmap> {
+    let mut pixmap = Pixmap::new(decoded.width(), decoded.height())?;
+    let dest = pixmap.data_mut();
+    // tiny-skia uses premultiplied alpha; the decoded buffer is
+    // straight alpha.  Premultiply on copy.
+    dest.chunks_exact_mut(4)
+        .zip(decoded.rgba().chunks_exact(4))
+        .for_each(|(out, src)| {
+            let alpha = u32::from(src[3]);
+            let premul = |c: u8| u8::try_from(u32::from(c) * alpha / 255).unwrap_or(0);
+            out[0] = premul(src[0]);
+            out[1] = premul(src[1]);
+            out[2] = premul(src[2]);
+            out[3] = src[3];
+        });
+    Some(pixmap)
 }
 
 /// Rasterize a slice of [`PaintCommand`]s into an RGBA pixel buffer.
@@ -114,7 +208,7 @@ fn rasterize_to_bytes(
 ) -> Vec<u8> {
     Pixmap::new(width, height).map_or_else(
         || empty_bytes(width, height),
-        |pixmap| paint_commands(pixmap, commands, text_renderer),
+        |pixmap| paint_commands_into(pixmap, commands, text_renderer).take(),
     )
 }
 
@@ -128,25 +222,6 @@ fn empty_bytes(width: u32, height: u32) -> Vec<u8> {
         })
         .unwrap_or(0);
     vec![0; total]
-}
-
-fn paint_commands(
-    pixmap_in: Pixmap,
-    commands: &[PaintCommand],
-    text_renderer: &mut TextRenderer,
-) -> Vec<u8> {
-    // External `&mut self` carve-out for tiny-skia's `fill_path` /
-    // `stroke_path`.  Pixmap construction returns an owned value; we
-    // shadow the binding as `mut` only to satisfy the tiny-skia API.
-    let mut pixmap = pixmap_in;
-    pixmap.fill(tiny_skia::Color::TRANSPARENT);
-    // `for_each` over an iterator (not a `for` loop) preserves
-    // combinator style; the lint that prefers `for` is overridden.
-    #[allow(clippy::needless_for_each)]
-    commands.iter().for_each(|cmd| {
-        apply_command(&mut pixmap, cmd, text_renderer);
-    });
-    pixmap.take()
 }
 
 fn apply_command(pixmap: &mut Pixmap, command: &PaintCommand, text_renderer: &mut TextRenderer) {
@@ -216,6 +291,12 @@ fn build_paint(color: &layout_cat::Color) -> Paint<'static> {
     paint.set_color(skia_color);
     paint.anti_alias = true;
     paint
+}
+
+fn u32_to_f32_lossy(value: u32) -> f32 {
+    #[allow(clippy::cast_precision_loss)]
+    let n = value as f32;
+    n
 }
 
 fn f32_from_f64(value: f64) -> f32 {

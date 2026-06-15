@@ -461,9 +461,7 @@ fn prevent_default_noop_on_non_cancelable_event_through_runtime() -> Result<(), 
     )?;
     matches!(frame.script_value(), Value::Boolean(true))
         .then_some(())
-        .ok_or_else(|| {
-            fail("expected dispatchEvent to return true when event is not cancelable")
-        })
+        .ok_or_else(|| fail("expected dispatchEvent to return true when event is not cancelable"))
 }
 
 #[test]
@@ -507,7 +505,9 @@ fn query_selector_all_iterable_via_for_loop_through_runtime() -> Result<(), Erro
     )?;
     matches!(frame.script_value(), Value::String(s) if s == "abc")
         .then_some(())
-        .ok_or_else(|| fail("expected for-loop iteration over NodeList to visit textContent in order"))
+        .ok_or_else(|| {
+            fail("expected for-loop iteration over NodeList to visit textContent in order")
+        })
 }
 
 #[test]
@@ -569,9 +569,7 @@ fn first_child_pseudo_class_through_runtime() -> Result<(), Error> {
     )?;
     matches!(frame.script_value(), Value::Number(n) if (n - 2.0).abs() < 1e-9)
         .then_some(())
-        .ok_or_else(|| {
-            fail("expected p:first-child to match one p per section (length === 2)")
-        })
+        .ok_or_else(|| fail("expected p:first-child to match one p per section (length === 2)"))
 }
 
 #[test]

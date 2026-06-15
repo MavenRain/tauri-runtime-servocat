@@ -40,6 +40,7 @@
 
 pub mod error;
 pub mod frame;
+pub mod images;
 pub mod ipc;
 pub mod pipeline;
 pub mod raster;
@@ -50,9 +51,10 @@ pub mod window;
 
 pub use error::Error;
 pub use frame::Frame;
+pub use images::{DecodedImage, collect_inline_images, decode_data_url, decode_png_bytes};
 pub use ipc::HostCommands;
 pub use layout_cat::Viewport;
-pub use pipeline::render;
+pub use pipeline::{render, render_with_inline_assets};
 pub use raster::{PixelBuffer, render_to_pixels, render_to_pixels_with};
 pub use script::{
     DEFAULT_FUEL, ScriptOutcome, run_script, run_script_with_backprop, run_script_with_commands,
