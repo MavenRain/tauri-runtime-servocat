@@ -1,8 +1,8 @@
 [package]
 name = "tauri-runtime-servocat"
-version = "3.30.0"
+version = "3.31.0"
 edition = "2024"
-description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.30.0 picks up web-api-cat 0.7.17 + 0.7.18.  0.7.17 adds the `:empty` and `:root` pseudo-classes and fixes a document.querySelector semantic gap so `:root` and `html` selectors resolve against the document element.  0.7.18 wires form-control inputs to scripts: `<input>.value` and `<input>.checked` accessor-pair properties reflect the HTML attributes and the `:checked` pseudo-class agrees with the post-setter state -- the first move toward the form-input story for a Tauri opt-in backend pitch.  No tauri-runtime-servocat source change beyond the manifest.  Seventh sub-crate of a Servo-replacement webview runtime targeting Tauri."
+description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.31.0 picks up web-api-cat 0.7.19 + 0.7.20.  0.7.19 finishes the form-state pseudo trio with `:disabled` and `:enabled`, tag-gated to the HTML form-control set.  0.7.20 wires the `<img>` element to scripts via a seven-property accessor pack: `src` / `alt` / `width` / `height` reflect HTML attributes, and `naturalWidth` / `naturalHeight` / `complete` read hidden state slots that this runtime will populate from the fetch + decode pipeline.  Public helpers `web_api_cat::image::set_natural_size` and `set_complete` are now the integration points for the downstream image-rendering chunk.  No tauri-runtime-servocat source change beyond the manifest in this release.  Seventh sub-crate of a Servo-replacement webview runtime targeting Tauri."
 license = "MIT OR Apache-2.0"
 keywords = ["tauri", "runtime", "browser", "servo", "type-driven"]
 categories = ["gui", "rendering"]
@@ -16,7 +16,7 @@ paint-cat = "0.2"
 net-cat = { version = "0.3", features = ["tls"] }
 boa-cat = "0.7.2"
 ecma-runtime-cat = "0.3.1"
-web-api-cat = "0.7.18"
+web-api-cat = "0.7.20"
 ecma-lex-cat = "0.1"
 ecma-parse-cat = "0.3"
 tiny-skia = "0.12"
