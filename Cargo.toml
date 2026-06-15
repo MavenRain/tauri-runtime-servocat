@@ -1,8 +1,8 @@
 [package]
 name = "tauri-runtime-servocat"
-version = "3.27.0"
+version = "3.28.0"
 edition = "2024"
-description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.27.0 picks up web-api-cat 0.7.14: `getElementsByTagName(name)` and `getElementsByClassName(classNames)` are now reachable from user-supplied webview scripts on both `Element` and `document`, returning NodeList-shaped Objects.  No tauri-runtime-servocat source change beyond the manifest.  Seventh sub-crate of a Servo-replacement webview runtime targeting Tauri."
+description = "Servo-replacement runtime for Tauri: wires html-cat, css-cat, dom-cat, layout-cat, paint-cat, net-cat, boa-cat, ecma-runtime-cat, and web-api-cat into a single rendering + scripting pipeline.  v3.28.0 picks up web-api-cat 0.7.15: the `:not(selector)` negation pseudo-class is now reachable from user-supplied webview scripts via `querySelector`, `querySelectorAll`, `matches`, and `closest`.  The argument is a full SelectorList so `:not(.foo, .bar)` (Selectors Level 3 list arg) and `:not(:not(.foo))` (Selectors Level 4 nested negation) both work via balanced-paren scanning.  No tauri-runtime-servocat source change beyond the manifest.  Seventh sub-crate of a Servo-replacement webview runtime targeting Tauri."
 license = "MIT OR Apache-2.0"
 keywords = ["tauri", "runtime", "browser", "servo", "type-driven"]
 categories = ["gui", "rendering"]
@@ -16,7 +16,7 @@ paint-cat = "0.2"
 net-cat = { version = "0.3", features = ["tls"] }
 boa-cat = "0.7.2"
 ecma-runtime-cat = "0.3.1"
-web-api-cat = "0.7.14"
+web-api-cat = "0.7.15"
 ecma-lex-cat = "0.1"
 ecma-parse-cat = "0.3"
 tiny-skia = "0.12"
